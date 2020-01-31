@@ -2,7 +2,9 @@ import json
 
 import graphene
 import pytest
+from django.utils import timezone
 from django.utils.text import slugify
+from freezegun import freeze_time
 
 from saleor.page.models import Page
 from tests.api.utils import get_graphql_content
@@ -144,6 +146,21 @@ def test_page_create_mutation(staff_api_client, permission_manage_pages):
     assert data["page"]["isPublished"] == page_is_published
 
 
+def test_page_create_required_fields(staff_api_client, permission_manage_pages):
+    response = staff_api_client.post_graphql(
+        CREATE_PAGE_MUTATION, {}, permissions=[permission_manage_pages]
+    )
+    content = get_graphql_content(response)
+    errors = content["data"]["pageCreate"]["errors"]
+
+    err_msg = "This field cannot be blank."
+    title_error = {"field": "slug", "message": err_msg}
+    slug_error = {"field": "title", "message": err_msg}
+
+    assert title_error in errors
+    assert slug_error in errors
+
+
 def test_create_default_slug(staff_api_client, permission_manage_pages):
     # test creating root page
     title = "Spanish inquisition"
@@ -259,3 +276,105 @@ def test_bulk_unpublish(staff_api_client, page_list, permission_manage_pages):
 
     assert content["data"]["pageBulkPublish"]["count"] == len(page_list)
     assert not any(page.is_published for page in page_list)
+
+
+@pytest.mark.parametrize(
+    "page_filter, count",
+    [
+        ({"search": "Page1"}, 1),
+        ({"search": "slug_page_2"}, 1),
+        ({"search": "test"}, 1),
+        ({"search": "slug_"}, 3),
+        ({"search": "Page"}, 2),
+    ],
+)
+def test_pages_query_with_filter(
+    page_filter, count, staff_api_client, permission_manage_pages
+):
+    query = """
+        query ($filter: PageFilterInput) {
+            pages(first: 5, filter:$filter) {
+                totalCount
+                edges {
+                    node {
+                        id
+                    }
+                }
+            }
+        }
+    """
+    Page.objects.create(title="Page1", slug="slug_page_1", content="Content for page 1")
+    Page.objects.create(title="Page2", slug="slug_page_2", content="Content for page 2")
+    Page.objects.create(title="About", slug="slug_about", content="About test content")
+    variables = {"filter": page_filter}
+    staff_api_client.user.user_permissions.add(permission_manage_pages)
+    response = staff_api_client.post_graphql(query, variables)
+    content = get_graphql_content(response)
+    assert content["data"]["pages"]["totalCount"] == count
+
+
+QUERY_PAGE_WITH_SORT = """
+    query ($sort_by: PageSortingInput!) {
+        pages(first:5, sortBy: $sort_by) {
+            edges{
+                node{
+                    title
+                }
+            }
+        }
+    }
+"""
+
+
+@pytest.mark.parametrize(
+    "page_sort, result_order",
+    [
+        ({"field": "TITLE", "direction": "ASC"}, ["About", "Page1", "Page2"]),
+        ({"field": "TITLE", "direction": "DESC"}, ["Page2", "Page1", "About"]),
+        ({"field": "SLUG", "direction": "ASC"}, ["About", "Page2", "Page1"]),
+        ({"field": "SLUG", "direction": "DESC"}, ["Page1", "Page2", "About"]),
+        ({"field": "VISIBILITY", "direction": "ASC"}, ["Page2", "Page1", "About"]),
+        ({"field": "VISIBILITY", "direction": "DESC"}, ["Page1", "About", "Page2"]),
+        ({"field": "CREATION_DATE", "direction": "ASC"}, ["Page1", "About", "Page2"]),
+        ({"field": "CREATION_DATE", "direction": "DESC"}, ["Page2", "About", "Page1"]),
+        (
+            {"field": "PUBLICATION_DATE", "direction": "ASC"},
+            ["Page1", "Page2", "About"],
+        ),
+        (
+            {"field": "PUBLICATION_DATE", "direction": "DESC"},
+            ["About", "Page2", "Page1"],
+        ),
+    ],
+)
+def test_query_pages_with_sort(
+    page_sort, result_order, staff_api_client, permission_manage_pages
+):
+    with freeze_time("2017-05-31 12:00:01"):
+        Page.objects.create(
+            title="Page1",
+            slug="slug_page_1",
+            content="p1",
+            is_published=True,
+            publication_date=timezone.now().replace(year=2018, month=12, day=5),
+        )
+    with freeze_time("2019-05-31 12:00:01"):
+        Page.objects.create(
+            title="Page2",
+            slug="page_2",
+            content="p2",
+            is_published=False,
+            publication_date=timezone.now().replace(year=2019, month=12, day=5),
+        )
+    with freeze_time("2018-05-31 12:00:01"):
+        Page.objects.create(
+            title="About", slug="about", content="Ab", is_published=True
+        )
+    variables = {"sort_by": page_sort}
+    staff_api_client.user.user_permissions.add(permission_manage_pages)
+    response = staff_api_client.post_graphql(QUERY_PAGE_WITH_SORT, variables)
+    content = get_graphql_content(response)
+    pages = content["data"]["pages"]["edges"]
+
+    for order, page_name in enumerate(result_order):
+        assert pages[order]["node"]["title"] == page_name

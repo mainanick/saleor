@@ -1,5 +1,5 @@
 import graphene
-from django_prices.templatetags import prices_i18n
+from django_prices.templatetags import prices
 
 from ..enums import TaxRateType
 
@@ -8,14 +8,19 @@ class Money(graphene.ObjectType):
     currency = graphene.String(description="Currency code.", required=True)
     amount = graphene.Float(description="Amount of money.", required=True)
     localized = graphene.String(
-        description="Money formatted according to the current locale.", required=True
+        description="Money formatted according to the current locale.",
+        required=True,
+        deprecation_reason="DEPRECATED: Will be removed in Saleor 2.11. "
+        "Price formatting according to the current locale should be "
+        "handled by the frontend client.",
     )
 
     class Meta:
         description = "Represents amount of money in specific currency."
 
-    def resolve_localized(self, _info):
-        return prices_i18n.amount(self)
+    @staticmethod
+    def resolve_localized(root, _info):
+        return prices.amount(root)
 
 
 class MoneyRange(graphene.ObjectType):
@@ -37,9 +42,10 @@ class TaxedMoney(graphene.ObjectType):
     tax = graphene.Field(Money, description="Amount of taxes.", required=True)
 
     class Meta:
-        description = """Represents a monetary value with taxes. In
-        case when taxes were not applied, net and gross values will be equal.
-        """
+        description = (
+            "Represents a monetary value with taxes. In cases where taxes were not "
+            "applied, net and gross values will be equal."
+        )
 
 
 class TaxedMoneyRange(graphene.ObjectType):
@@ -62,11 +68,13 @@ class VAT(graphene.ObjectType):
     class Meta:
         description = "Represents a VAT rate for a country."
 
-    def resolve_standard_rate(self, _info):
-        return self.data.get("standard_rate")
+    @staticmethod
+    def resolve_standard_rate(root, _info):
+        return root.data.get("standard_rate")
 
-    def resolve_reduced_rates(self, _info):
-        reduced_rates = self.data.get("reduced_rates", {}) or {}
+    @staticmethod
+    def resolve_reduced_rates(root, _info):
+        reduced_rates = root.data.get("reduced_rates", {}) or {}
         return [
             ReducedRate(rate=rate, rate_type=rate_type)
             for rate_type, rate in reduced_rates.items()

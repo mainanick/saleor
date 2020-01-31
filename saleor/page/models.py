@@ -1,10 +1,9 @@
-from django.contrib.postgres.fields import JSONField
 from django.db import models
-from django.urls import reverse
-from django.utils.translation import pgettext_lazy
+from draftjs_sanitizer import clean_draft_js
 
+from ..core.db.fields import SanitizedJSONField
 from ..core.models import PublishableModel, PublishedQuerySet
-from ..core.utils import build_absolute_uri
+from ..core.permissions import PagePermissions
 from ..core.utils.translations import TranslationProxy
 from ..seo.models import SeoModel, SeoModelTranslation
 
@@ -12,14 +11,16 @@ from ..seo.models import SeoModel, SeoModelTranslation
 class PagePublishedQuerySet(PublishedQuerySet):
     @staticmethod
     def user_has_access_to_all(user):
-        return user.is_active and user.has_perm("page.manage_pages")
+        return user.is_active and user.has_perm(PagePermissions.MANAGE_PAGES)
 
 
 class Page(SeoModel, PublishableModel):
     slug = models.SlugField(unique=True, max_length=100)
     title = models.CharField(max_length=200)
     content = models.TextField(blank=True)
-    content_json = JSONField(blank=True, default=dict)
+    content_json = SanitizedJSONField(
+        blank=True, default=dict, sanitizer=clean_draft_js
+    )
     created = models.DateTimeField(auto_now_add=True)
 
     objects = PagePublishedQuerySet.as_manager()
@@ -27,18 +28,15 @@ class Page(SeoModel, PublishableModel):
 
     class Meta:
         ordering = ("slug",)
-        permissions = (
-            ("manage_pages", pgettext_lazy("Permission description", "Manage pages.")),
-        )
+        permissions = ((PagePermissions.MANAGE_PAGES.codename, "Manage pages."),)
 
     def __str__(self):
         return self.title
 
-    def get_absolute_url(self):
-        return reverse("page:details", kwargs={"slug": self.slug})
-
-    def get_full_url(self):
-        return build_absolute_uri(self.get_absolute_url())
+    # Deprecated. To remove in #5022
+    @staticmethod
+    def get_absolute_url():
+        return ""
 
 
 class PageTranslation(SeoModelTranslation):
@@ -48,7 +46,9 @@ class PageTranslation(SeoModelTranslation):
     )
     title = models.CharField(max_length=255, blank=True)
     content = models.TextField(blank=True)
-    content_json = JSONField(blank=True, default=dict)
+    content_json = SanitizedJSONField(
+        blank=True, default=dict, sanitizer=clean_draft_js
+    )
 
     class Meta:
         unique_together = (("language_code", "page"),)

@@ -1,38 +1,132 @@
 import uuid
+from decimal import Decimal
+from unittest import mock
 from unittest.mock import ANY, patch
 
 import graphene
 import pytest
 from django.core.exceptions import ValidationError
+from prices import Money, TaxedMoney
 
+from saleor.account.models import User
+from saleor.checkout import calculations
+from saleor.checkout.error_codes import CheckoutErrorCode
 from saleor.checkout.models import Checkout
-from saleor.checkout.utils import add_voucher_to_checkout, clean_checkout, is_fully_paid
-from saleor.graphql.core.utils import str_to_enum
+from saleor.checkout.utils import clean_checkout, is_fully_paid
+from saleor.core.payments import PaymentInterface
+from saleor.core.taxes import zero_money
+from saleor.extensions.manager import ExtensionsManager
+from saleor.graphql.checkout.mutations import (
+    clean_shipping_method,
+    update_checkout_shipping_method_if_invalid,
+)
 from saleor.order.models import Order
-from tests.api.utils import get_graphql_content
+from saleor.payment import TransactionKind
+from saleor.payment.interface import GatewayResponse
+from saleor.shipping import ShippingMethodType
+from saleor.shipping.models import ShippingMethod
+from saleor.warehouse.models import Stock
+from tests.api.utils import assert_no_permission, get_graphql_content
+
+
+@pytest.fixture
+def other_shipping_method(shipping_zone):
+    return ShippingMethod.objects.create(
+        name="DPD",
+        minimum_order_price=Money(0, "USD"),
+        type=ShippingMethodType.PRICE_BASED,
+        price=Money(9, "USD"),
+        shipping_zone=shipping_zone,
+    )
+
+
+@pytest.fixture(autouse=True)
+def setup_dummy_gateway(settings):
+    settings.PLUGINS = ["saleor.payment.gateways.dummy.plugin.DummyGatewayPlugin"]
+    return settings
+
+
+def test_clean_shipping_method_after_shipping_address_changes_stay_the_same(
+    checkout_with_single_item, address, shipping_method, other_shipping_method
+):
+    """Ensure the current shipping method applies to new address.
+
+    If it does, then it doesn't need to be changed.
+    """
+
+    checkout = checkout_with_single_item
+    checkout.shipping_address = address
+
+    is_valid_method = clean_shipping_method(checkout, shipping_method, [])
+    assert is_valid_method is True
+
+
+def test_clean_shipping_method_does_nothing_if_no_shipping_method(
+    checkout_with_single_item, address, other_shipping_method
+):
+    """If no shipping method was selected, it shouldn't return an error."""
+
+    checkout = checkout_with_single_item
+    checkout.shipping_address = address
+
+    is_valid_method = clean_shipping_method(checkout, None, [])
+    assert is_valid_method is True
+
+
+def test_update_checkout_shipping_method_if_invalid(
+    checkout_with_single_item,
+    address,
+    shipping_method,
+    other_shipping_method,
+    shipping_zone_without_countries,
+):
+    """If the shipping method is invalid, it should replace it."""
+
+    checkout = checkout_with_single_item
+    checkout.shipping_address = address
+    checkout.shipping_method = shipping_method
+
+    shipping_method.shipping_zone = shipping_zone_without_countries
+    shipping_method.save(update_fields=["shipping_zone"])
+
+    update_checkout_shipping_method_if_invalid(checkout, None)
+
+    assert checkout.shipping_method == other_shipping_method
+
+    # Ensure the checkout's shipping method was saved
+    checkout.refresh_from_db(fields=["shipping_method"])
+    assert checkout.shipping_method == other_shipping_method
+
 
 MUTATION_CHECKOUT_CREATE = """
     mutation createCheckout($checkoutInput: CheckoutCreateInput!) {
-        checkoutCreate(input: $checkoutInput) {
-            checkout {
-                id
-                token
-                email
-                lines {
-                    quantity
-                }
-            }
-            errors {
-                field
-                message
-            }
+      checkoutCreate(input: $checkoutInput) {
+        created
+        checkout {
+          id
+          token
+          email
+          lines {
+            quantity
+          }
         }
+        errors {
+          field
+          message
+        }
+        checkoutErrors {
+          field
+          message
+          code
+        }
+      }
     }
-    """
+"""
 
 
-def test_checkout_create(api_client, variant, graphql_address_data):
+def test_checkout_create(api_client, stock, graphql_address_data):
     """Create checkout object using GraphQL API."""
+    variant = stock.product_variant
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
     test_email = "test@example.com"
     shipping_address = graphql_address_data
@@ -45,11 +139,14 @@ def test_checkout_create(api_client, variant, graphql_address_data):
     }
     assert not Checkout.objects.exists()
     response = api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
-    content = get_graphql_content(response)
+    content = get_graphql_content(response)["data"]["checkoutCreate"]
+
+    # Look at the flag to see whether a new checkout was created or not
+    assert content["created"] is True
 
     new_checkout = Checkout.objects.first()
     assert new_checkout is not None
-    checkout_data = content["data"]["checkoutCreate"]["checkout"]
+    checkout_data = content["checkout"]
     assert checkout_data["token"] == str(new_checkout.token)
     assert new_checkout.lines.count() == 1
     checkout_line = new_checkout.lines.first()
@@ -71,16 +168,36 @@ def test_checkout_create(api_client, variant, graphql_address_data):
     assert new_checkout.shipping_address.city == shipping_address["city"].upper()
 
 
-def test_checkout_create_cannot_add_too_many_quantities(
-    api_client, variant, graphql_address_data
+@pytest.mark.parametrize(
+    "quantity, expected_error_message, error_code",
+    (
+        (
+            -1,
+            "The quantity should be higher than zero.",
+            CheckoutErrorCode.ZERO_QUANTITY,
+        ),
+        (
+            51,
+            "Cannot add more than 50 times this item.",
+            CheckoutErrorCode.QUANTITY_GREATER_THAN_LIMIT,
+        ),
+    ),
+)
+def test_checkout_create_cannot_add_invalid_quantities(
+    api_client,
+    stock,
+    graphql_address_data,
+    quantity,
+    expected_error_message,
+    error_code,
 ):
-
+    variant = stock.product_variant
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
     test_email = "test@example.com"
     shipping_address = graphql_address_data
     variables = {
         "checkoutInput": {
-            "lines": [{"quantity": 51, "variantId": variant_id}],
+            "lines": [{"quantity": quantity, "variantId": variant_id}],
             "email": test_email,
             "shippingAddress": shipping_address,
         }
@@ -90,22 +207,34 @@ def test_checkout_create_cannot_add_too_many_quantities(
     content = get_graphql_content(response)["data"]["checkoutCreate"]
     assert content["errors"]
     assert content["errors"] == [
-        {"field": "quantity", "message": "Cannot add more than 50 times this item."}
+        {"field": "quantity", "message": expected_error_message}
+    ]
+
+    assert content["checkoutErrors"] == [
+        {
+            "field": "quantity",
+            "message": expected_error_message,
+            "code": error_code.name,
+        }
     ]
 
 
-def test_checkout_create_reuse_checkout(checkout, user_api_client, variant):
+def test_checkout_create_reuse_checkout(checkout, user_api_client, stock):
     # assign user to the checkout
     checkout.user = user_api_client.user
     checkout.save()
+    variant = stock.product_variant
 
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
     variables = {"checkoutInput": {"lines": [{"quantity": 1, "variantId": variant_id}]}}
     response = user_api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
-    content = get_graphql_content(response)
+    content = get_graphql_content(response)["data"]["checkoutCreate"]
+
+    # Look at the flag to see whether a new checkout was created or not
+    assert not content["created"]
 
     # assert that existing checkout was reused and returned by mutation
-    checkout_data = content["data"]["checkoutCreate"]["checkout"]
+    checkout_data = content["checkout"]
     assert checkout_data["token"] == str(checkout.token)
 
     # if checkout was reused it should be returned unmodified (e.g. without
@@ -113,7 +242,8 @@ def test_checkout_create_reuse_checkout(checkout, user_api_client, variant):
     assert checkout_data["lines"] == []
 
 
-def test_checkout_create_required_email(api_client, variant):
+def test_checkout_create_required_email(api_client, stock):
+    variant = stock.product_variant
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
     variables = {
         "checkoutInput": {
@@ -130,8 +260,12 @@ def test_checkout_create_required_email(api_client, variant):
     assert errors[0]["field"] == "email"
     assert errors[0]["message"] == "This field cannot be blank."
 
+    checkout_errors = content["data"]["checkoutCreate"]["checkoutErrors"]
+    assert checkout_errors[0]["code"] == CheckoutErrorCode.REQUIRED.name
 
-def test_checkout_create_default_email_for_logged_in_customer(user_api_client, variant):
+
+def test_checkout_create_default_email_for_logged_in_customer(user_api_client, stock):
+    variant = stock.product_variant
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
     variables = {"checkoutInput": {"lines": [{"quantity": 1, "variantId": variant_id}]}}
     response = user_api_client.post_graphql(MUTATION_CHECKOUT_CREATE, variables)
@@ -145,7 +279,8 @@ def test_checkout_create_default_email_for_logged_in_customer(user_api_client, v
     assert new_checkout.email == customer.email
 
 
-def test_checkout_create_logged_in_customer(user_api_client, variant):
+def test_checkout_create_logged_in_customer(user_api_client, stock):
+    variant = stock.product_variant
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
     variables = {
         "checkoutInput": {
@@ -176,7 +311,8 @@ def test_checkout_create_logged_in_customer(user_api_client, variant):
     assert customer.email == new_checkout.email
 
 
-def test_checkout_create_logged_in_customer_custom_email(user_api_client, variant):
+def test_checkout_create_logged_in_customer_custom_email(user_api_client, stock):
+    variant = stock.product_variant
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
     customer = user_api_client.user
     custom_email = "custom@example.com"
@@ -200,8 +336,9 @@ def test_checkout_create_logged_in_customer_custom_email(user_api_client, varian
 
 
 def test_checkout_create_logged_in_customer_custom_addresses(
-    user_api_client, variant, graphql_address_data
+    user_api_client, stock, graphql_address_data
 ):
+    variant = stock.product_variant
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
     shipping_address = graphql_address_data
     billing_address = graphql_address_data
@@ -232,8 +369,9 @@ def test_checkout_create_logged_in_customer_custom_addresses(
 
 
 def test_checkout_create_check_lines_quantity(
-    user_api_client, variant, graphql_address_data
+    user_api_client, stock, graphql_address_data
 ):
+    variant = stock.product_variant
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.id)
     test_email = "test@example.com"
     shipping_address = graphql_address_data
@@ -254,11 +392,27 @@ def test_checkout_create_check_lines_quantity(
     assert data["errors"][0]["field"] == "quantity"
 
 
-def test_checkout_available_payment_gateways(api_client, checkout_with_item, settings):
+@pytest.fixture
+def expected_dummy_gateway():
+    return {
+        "name": "Dummy",
+        "config": [{"field": "store_customer_card", "value": "false"}],
+    }
+
+
+def test_checkout_available_payment_gateways(
+    api_client, checkout_with_item, expected_dummy_gateway
+):
     query = """
     query getCheckout($token: UUID!) {
         checkout(token: $token) {
-           availablePaymentGateways
+           availablePaymentGateways {
+               name
+               config {
+                   field
+                   value
+               }
+           }
         }
     }
     """
@@ -266,10 +420,7 @@ def test_checkout_available_payment_gateways(api_client, checkout_with_item, set
     response = api_client.post_graphql(query, variables)
     content = get_graphql_content(response)
     data = content["data"]["checkout"]
-    checkout_payment_gateways = [
-        str_to_enum(gateway) for gateway in settings.CHECKOUT_PAYMENT_GATEWAYS.keys()
-    ]
-    assert data["availablePaymentGateways"] == checkout_payment_gateways
+    assert data["availablePaymentGateways"] == [expected_dummy_gateway]
 
 
 def test_checkout_available_shipping_methods(
@@ -294,6 +445,57 @@ def test_checkout_available_shipping_methods(
 
     shipping_method = shipping_zone.shipping_methods.first()
     assert data["availableShippingMethods"] == [{"name": shipping_method.name}]
+
+
+@pytest.mark.parametrize(
+    "expected_price_type, expected_price, display_gross_prices",
+    (("gross", 13, True), ("net", 10, False)),
+)
+def test_checkout_available_shipping_methods_with_price_displayed(
+    expected_price_type,
+    expected_price,
+    display_gross_prices,
+    monkeypatch,
+    api_client,
+    checkout_with_item,
+    address,
+    shipping_zone,
+    site_settings,
+):
+    shipping_method = shipping_zone.shipping_methods.first()
+    taxed_price = TaxedMoney(net=Money(10, "USD"), gross=Money(13, "USD"))
+    apply_taxes_to_shipping_mock = mock.Mock(return_value=taxed_price)
+    monkeypatch.setattr(
+        ExtensionsManager, "apply_taxes_to_shipping", apply_taxes_to_shipping_mock
+    )
+    site_settings.display_gross_prices = display_gross_prices
+    site_settings.save()
+    checkout_with_item.shipping_address = address
+    checkout_with_item.save()
+
+    query = """
+    query getCheckout($token: UUID!) {
+        checkout(token: $token) {
+            availableShippingMethods {
+                name
+                price {
+                    amount
+                }
+            }
+        }
+    }
+    """
+    variables = {"token": checkout_with_item.token}
+    response = api_client.post_graphql(query, variables)
+    content = get_graphql_content(response)
+    data = content["data"]["checkout"]
+
+    apply_taxes_to_shipping_mock.assert_called_once_with(
+        shipping_method.price, mock.ANY
+    )
+    assert data["availableShippingMethods"] == [
+        {"name": "DHL", "price": {"amount": expected_price}}
+    ]
 
 
 def test_checkout_no_available_shipping_methods_without_address(
@@ -355,7 +557,14 @@ MUTATION_CHECKOUT_LINES_ADD = """
     }"""
 
 
-def test_checkout_lines_add(user_api_client, checkout_with_item, variant):
+@mock.patch(
+    "saleor.graphql.checkout.mutations.update_checkout_shipping_method_if_invalid",
+    wraps=update_checkout_shipping_method_if_invalid,
+)
+def test_checkout_lines_add(
+    mocked_update_shipping_method, user_api_client, checkout_with_item, stock
+):
+    variant = stock.product_variant
     checkout = checkout_with_item
     line = checkout.lines.first()
     assert line.quantity == 3
@@ -375,8 +584,11 @@ def test_checkout_lines_add(user_api_client, checkout_with_item, variant):
     assert line.variant == variant
     assert line.quantity == 1
 
+    mocked_update_shipping_method.assert_called_once_with(checkout, mock.ANY)
 
-def test_checkout_lines_add_too_many(user_api_client, checkout_with_item, variant):
+
+def test_checkout_lines_add_too_many(user_api_client, checkout_with_item, stock):
+    variant = stock.product_variant
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
     checkout_id = graphene.Node.to_global_id("Checkout", checkout_with_item.pk)
 
@@ -393,7 +605,8 @@ def test_checkout_lines_add_too_many(user_api_client, checkout_with_item, varian
     ]
 
 
-def test_checkout_lines_add_empty_checkout(user_api_client, checkout, variant):
+def test_checkout_lines_add_empty_checkout(user_api_client, checkout, stock):
+    variant = stock.product_variant
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
 
@@ -411,7 +624,8 @@ def test_checkout_lines_add_empty_checkout(user_api_client, checkout, variant):
     assert line.quantity == 1
 
 
-def test_checkout_lines_add_check_lines_quantity(user_api_client, checkout, variant):
+def test_checkout_lines_add_check_lines_quantity(user_api_client, checkout, stock):
+    variant = stock.product_variant
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
 
@@ -428,7 +642,8 @@ def test_checkout_lines_add_check_lines_quantity(user_api_client, checkout, vari
     assert data["errors"][0]["field"] == "quantity"
 
 
-def test_checkout_lines_invalid_variant_id(user_api_client, checkout, variant):
+def test_checkout_lines_invalid_variant_id(user_api_client, checkout, stock):
+    variant = stock.product_variant
     variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
     invalid_variant_id = "InvalidId"
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
@@ -470,7 +685,13 @@ MUTATION_CHECKOUT_LINES_UPDATE = """
     """
 
 
-def test_checkout_lines_update(user_api_client, checkout_with_item):
+@mock.patch(
+    "saleor.graphql.checkout.mutations.update_checkout_shipping_method_if_invalid",
+    wraps=update_checkout_shipping_method_if_invalid,
+)
+def test_checkout_lines_update(
+    mocked_update_shipping_method, user_api_client, checkout_with_item
+):
     checkout = checkout_with_item
     assert checkout.lines.count() == 1
     line = checkout.lines.first()
@@ -494,6 +715,8 @@ def test_checkout_lines_update(user_api_client, checkout_with_item):
     line = checkout.lines.first()
     assert line.variant == variant
     assert line.quantity == 1
+
+    mocked_update_shipping_method.assert_called_once_with(checkout, mock.ANY)
 
 
 def test_checkout_lines_update_invalid_checkout_id(user_api_client):
@@ -528,6 +751,30 @@ def test_checkout_lines_update_check_lines_quantity(
     assert data["errors"][0]["field"] == "quantity"
 
 
+def test_checkout_lines_update_with_chosen_shipping(
+    user_api_client, checkout, stock, address, shipping_method
+):
+    checkout.shipping_address = address
+    checkout.shipping_method = shipping_method
+    checkout.save()
+
+    variant = stock.product_variant
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
+
+    variables = {
+        "checkoutId": checkout_id,
+        "lines": [{"variantId": variant_id, "quantity": 1}],
+    }
+    response = user_api_client.post_graphql(MUTATION_CHECKOUT_LINES_UPDATE, variables)
+    content = get_graphql_content(response)
+
+    data = content["data"]["checkoutLinesUpdate"]
+    assert not data["errors"]
+    checkout.refresh_from_db()
+    assert checkout.quantity == 1
+
+
 MUTATION_CHECKOUT_LINES_DELETE = """
     mutation checkoutLineDelete($checkoutId: ID!, $lineId: ID!) {
         checkoutLineDelete(checkoutId: $checkoutId, lineId: $lineId) {
@@ -549,7 +796,13 @@ MUTATION_CHECKOUT_LINES_DELETE = """
 """
 
 
-def test_checkout_line_delete(user_api_client, checkout_with_item):
+@mock.patch(
+    "saleor.graphql.checkout.mutations.update_checkout_shipping_method_if_invalid",
+    wraps=update_checkout_shipping_method_if_invalid,
+)
+def test_checkout_line_delete(
+    mocked_update_shipping_method, user_api_client, checkout_with_item
+):
     checkout = checkout_with_item
     assert checkout.lines.count() == 1
     line = checkout.lines.first()
@@ -566,9 +819,42 @@ def test_checkout_line_delete(user_api_client, checkout_with_item):
     assert not data["errors"]
     checkout.refresh_from_db()
     assert checkout.lines.count() == 0
+    mocked_update_shipping_method.assert_called_once_with(checkout, mock.ANY)
 
 
-def test_checkout_customer_attach(user_api_client, checkout_with_item, customer_user):
+@mock.patch(
+    "saleor.graphql.checkout.mutations.update_checkout_shipping_method_if_invalid",
+    wraps=update_checkout_shipping_method_if_invalid,
+)
+def test_checkout_line_delete_by_zero_quantity(
+    mocked_update_shipping_method, user_api_client, checkout_with_item
+):
+    checkout = checkout_with_item
+    assert checkout.lines.count() == 1
+    line = checkout.lines.first()
+    variant = line.variant
+    assert line.quantity == 3
+
+    variant_id = graphene.Node.to_global_id("ProductVariant", variant.pk)
+    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
+
+    variables = {
+        "checkoutId": checkout_id,
+        "lines": [{"variantId": variant_id, "quantity": 0}],
+    }
+    response = user_api_client.post_graphql(MUTATION_CHECKOUT_LINES_UPDATE, variables)
+    content = get_graphql_content(response)
+
+    data = content["data"]["checkoutLinesUpdate"]
+    assert not data["errors"]
+    checkout.refresh_from_db()
+    assert checkout.lines.count() == 0
+    mocked_update_shipping_method.assert_called_once_with(checkout, mock.ANY)
+
+
+def test_checkout_customer_attach(
+    api_client, user_api_client, checkout_with_item, customer_user
+):
     checkout = checkout_with_item
     assert checkout.user is None
 
@@ -588,15 +874,25 @@ def test_checkout_customer_attach(user_api_client, checkout_with_item, customer_
     """
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
     customer_id = graphene.Node.to_global_id("User", customer_user.pk)
-
     variables = {"checkoutId": checkout_id, "customerId": customer_id}
+
+    # Mutation should fail for unauthenticated customers
+    response = api_client.post_graphql(query, variables)
+    assert_no_permission(response)
+
+    # Mutation should succeed for authenticated customer
     response = user_api_client.post_graphql(query, variables)
     content = get_graphql_content(response)
-
     data = content["data"]["checkoutCustomerAttach"]
     assert not data["errors"]
     checkout.refresh_from_db()
     assert checkout.user == customer_user
+
+    # Mutation with ID of a different user should fail as well
+    other_customer = User.objects.create_user("othercustomer@example.com", "password")
+    variables["customerId"] = graphene.Node.to_global_id("User", other_customer.pk)
+    response = user_api_client.post_graphql(query, variables)
+    assert_no_permission(response)
 
 
 MUTATION_CHECKOUT_CUSTOMER_DETACH = """
@@ -621,15 +917,25 @@ def test_checkout_customer_detach(user_api_client, checkout_with_item, customer_
 
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
     variables = {"checkoutId": checkout_id}
+
+    # Mutation should succeed if the user owns this checkout.
     response = user_api_client.post_graphql(
         MUTATION_CHECKOUT_CUSTOMER_DETACH, variables
     )
     content = get_graphql_content(response)
-
     data = content["data"]["checkoutCustomerDetach"]
     assert not data["errors"]
     checkout.refresh_from_db()
     assert checkout.user is None
+
+    # Mutation should fail when user calling it doesn't own the checkout.
+    other_user = User.objects.create_user("othercustomer@example.com", "password")
+    checkout.user = other_user
+    checkout.save()
+    response = user_api_client.post_graphql(
+        MUTATION_CHECKOUT_CUSTOMER_DETACH, variables
+    )
+    assert_no_permission(response)
 
 
 MUTATION_CHECKOUT_SHIPPING_ADDRESS_UPDATE = """
@@ -643,14 +949,26 @@ MUTATION_CHECKOUT_SHIPPING_ADDRESS_UPDATE = """
             },
             errors {
                 field,
+                message,
+            }
+            checkoutErrors {
+                field
                 message
+                code
             }
         }
     }"""
 
 
+@mock.patch(
+    "saleor.graphql.checkout.mutations.update_checkout_shipping_method_if_invalid",
+    wraps=update_checkout_shipping_method_if_invalid,
+)
 def test_checkout_shipping_address_update(
-    user_api_client, checkout_with_item, graphql_address_data
+    mocked_update_shipping_method,
+    user_api_client,
+    checkout_with_item,
+    graphql_address_data,
 ):
     checkout = checkout_with_item
     assert checkout.shipping_address is None
@@ -678,10 +996,41 @@ def test_checkout_shipping_address_update(
     assert checkout.shipping_address.postal_code == shipping_address["postalCode"]
     assert checkout.shipping_address.country == shipping_address["country"]
     assert checkout.shipping_address.city == shipping_address["city"].upper()
+    mocked_update_shipping_method.assert_called_once_with(checkout, mock.ANY)
+
+
+def test_checkout_shipping_address_with_invalid_phone_number_returns_error(
+    user_api_client, checkout_with_item, graphql_address_data
+):
+    checkout = checkout_with_item
+    assert checkout.shipping_address is None
+
+    shipping_address = graphql_address_data
+    shipping_address["phone"] = "+33600000"
+
+    response = get_graphql_content(
+        user_api_client.post_graphql(
+            MUTATION_CHECKOUT_SHIPPING_ADDRESS_UPDATE,
+            {
+                "checkoutId": graphene.Node.to_global_id("Checkout", checkout.pk),
+                "shippingAddress": shipping_address,
+            },
+        )
+    )["data"]["checkoutShippingAddressUpdate"]
+    assert response["errors"] == [
+        {"field": "phone", "message": "'+33600000' is not a valid phone number."}
+    ]
+    assert response["checkoutErrors"] == [
+        {
+            "field": "phone",
+            "message": "'+33600000' is not a valid phone number.",
+            "code": CheckoutErrorCode.INVALID.name,
+        }
+    ]
 
 
 @pytest.mark.parametrize(
-    "number", ["+48321321888", "+1 (555) 555-5555", "00 44 (0155 55) 5555"]
+    "number", ["+48321321888", "+44 (113) 892-1113", "00 44 (0) 20 7839 1377"]
 )
 def test_checkout_shipping_address_update_with_phone_country_prefix(
     number, user_api_client, checkout_with_item, graphql_address_data
@@ -710,7 +1059,7 @@ def test_checkout_shipping_address_update_without_phone_country_prefix(
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
 
     shipping_address = graphql_address_data
-    shipping_address["phone"] = "321321888"
+    shipping_address["phone"] = "+1-202-555-0132"
     variables = {"checkoutId": checkout_id, "shippingAddress": shipping_address}
 
     response = user_api_client.post_graphql(
@@ -719,26 +1068,6 @@ def test_checkout_shipping_address_update_without_phone_country_prefix(
     content = get_graphql_content(response)
     data = content["data"]["checkoutShippingAddressUpdate"]
     assert not data["errors"]
-
-
-def test_checkout_shipping_address_update_invalid_country_code(
-    user_api_client, checkout_with_item, graphql_address_data
-):
-    checkout = checkout_with_item
-    assert checkout.shipping_address is None
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-
-    shipping_address = graphql_address_data
-    shipping_address["country"] = "CODE"
-    variables = {"checkoutId": checkout_id, "shippingAddress": shipping_address}
-
-    response = user_api_client.post_graphql(
-        MUTATION_CHECKOUT_SHIPPING_ADDRESS_UPDATE, variables
-    )
-    content = get_graphql_content(response)
-    data = content["data"]["checkoutShippingAddressUpdate"]
-    assert data["errors"][0]["message"] == "Invalid country code."
-    assert data["errors"][0]["field"] == "country"
 
 
 def test_checkout_billing_address_update(
@@ -798,6 +1127,11 @@ CHECKOUT_EMAIL_UPDATE_MUTATION = """
                 field,
                 message
             }
+            checkoutErrors {
+                field,
+                message
+                code
+            }
         }
     }
 """
@@ -831,10 +1165,13 @@ def test_checkout_email_update_validation(user_api_client, checkout_with_item):
     assert errors[0]["field"] == "email"
     assert errors[0]["message"] == "This field cannot be blank."
 
+    checkout_errors = content["data"]["checkoutEmailUpdate"]["checkoutErrors"]
+    assert checkout_errors[0]["code"] == CheckoutErrorCode.REQUIRED.name
+
 
 MUTATION_CHECKOUT_COMPLETE = """
-    mutation checkoutComplete($checkoutId: ID!) {
-        checkoutComplete(checkoutId: $checkoutId) {
+    mutation checkoutComplete($checkoutId: ID!, $redirectUrl: String) {
+        checkoutComplete(checkoutId: $checkoutId, redirectUrl: $redirectUrl) {
             order {
                 id,
                 token
@@ -850,19 +1187,32 @@ MUTATION_CHECKOUT_COMPLETE = """
 
 @pytest.mark.integration
 def test_checkout_complete(
-    user_api_client, checkout_with_item, payment_dummy, address, shipping_method
+    user_api_client,
+    checkout_with_gift_card,
+    gift_card,
+    payment_dummy,
+    address,
+    shipping_method,
 ):
-    checkout = checkout_with_item
+
+    assert not gift_card.last_used_on
+
+    checkout = checkout_with_gift_card
     checkout.shipping_address = address
     checkout.shipping_method = shipping_method
     checkout.billing_address = address
+    checkout.store_meta(namespace="PUBLIC", client="PLUGIN", item={"accepted": "true"})
+    checkout.store_private_meta(
+        namespace="PRIVATE", client="PLUGIN", item={"accepted": "true"}
+    )
     checkout.save()
 
     checkout_line = checkout.lines.first()
     checkout_line_quantity = checkout_line.quantity
     checkout_line_variant = checkout_line.variant
 
-    total = checkout.get_total()
+    gift_current_balance = checkout.get_total_gift_cards_balance()
+    total = calculations.checkout_total(checkout)
     payment = payment_dummy
     payment.is_active = True
     payment.order = None
@@ -874,8 +1224,9 @@ def test_checkout_complete(
 
     orders_count = Order.objects.count()
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-    variables = {"checkoutId": checkout_id}
+    variables = {"checkoutId": checkout_id, "redirectUrl": "https://www.example.com"}
     response = user_api_client.post_graphql(MUTATION_CHECKOUT_COMPLETE, variables)
+
     content = get_graphql_content(response)
     data = content["data"]["checkoutComplete"]
     assert not data["errors"]
@@ -884,7 +1235,9 @@ def test_checkout_complete(
     assert Order.objects.count() == orders_count + 1
     order = Order.objects.first()
     assert order.token == order_token
-    assert order.total.gross == total.gross
+    assert order.total.gross == total.gross - gift_current_balance
+    assert order.meta == checkout.meta
+    assert order.private_meta == checkout.private_meta
 
     order_line = order.lines.first()
     assert checkout_line_quantity == order_line.quantity
@@ -896,20 +1249,115 @@ def test_checkout_complete(
     assert order_payment == payment
     assert payment.transactions.count() == 1
 
-    # assert that the checkout instance has been deleted after checkout
-    with pytest.raises(Checkout.DoesNotExist):
-        checkout.refresh_from_db()
+    gift_card.refresh_from_db()
+    assert gift_card.current_balance == zero_money()
+    assert gift_card.last_used_on
+
+    assert not Checkout.objects.filter(
+        pk=checkout.pk
+    ).exists(), "Checkout should have been deleted"
+
+
+ERROR_GATEWAY_RESPONSE = GatewayResponse(
+    is_success=False,
+    action_required=False,
+    kind=TransactionKind.CAPTURE,
+    amount=Decimal(0),
+    currency="usd",
+    transaction_id="1234",
+    error="ERROR",
+)
+
+
+def _process_payment_transaction_returns_error(*args, **kwards):
+    return ERROR_GATEWAY_RESPONSE
+
+
+def _process_payment_raise_error(*args, **kwargs):
+    raise Exception("Oops! Something went wrong.")
+
+
+@pytest.fixture(
+    params=[_process_payment_raise_error, _process_payment_transaction_returns_error]
+)
+def error_side_effect(request):
+    return request.param
+
+
+@pytest.fixture
+def fake_manager(mocker):
+    return mocker.Mock(spec=PaymentInterface)
+
+
+@pytest.fixture
+def mock_get_manager(mocker, fake_manager):
+    mgr = mocker.patch(
+        "saleor.payment.gateway.get_extensions_manager",
+        autospec=True,
+        return_value=fake_manager,
+    )
+    yield fake_manager
+    mgr.assert_called_once()
+
+
+def test_checkout_complete_does_not_delete_checkout_after_unsuccessful_payment(
+    mock_get_manager,
+    error_side_effect,
+    user_api_client,
+    checkout_with_voucher,
+    voucher,
+    payment_dummy,
+    address,
+    shipping_method,
+):
+    mock_get_manager.process_payment.side_effect = error_side_effect
+    expected_voucher_usage_count = voucher.used
+    checkout = checkout_with_voucher
+    checkout.shipping_address = address
+    checkout.shipping_method = shipping_method
+    checkout.billing_address = address
+    checkout.save()
+
+    taxed_total = calculations.checkout_total(checkout)
+    payment = payment_dummy
+    payment.is_active = True
+    payment.order = None
+    payment.total = taxed_total.gross.amount
+    payment.currency = taxed_total.gross.currency
+    payment.checkout = checkout
+    payment.save()
+    assert not payment.transactions.exists()
+
+    orders_count = Order.objects.count()
+    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
+    variables = {"checkoutId": checkout_id, "redirectUrl": "https://www.example.com"}
+    response = user_api_client.post_graphql(MUTATION_CHECKOUT_COMPLETE, variables)
+    get_graphql_content(response)
+
+    assert Order.objects.count() == orders_count
+
+    payment.refresh_from_db(fields=["order"])
+    transaction = payment.transactions.get()
+    assert transaction.error
+    assert payment.order is None
+
+    # ensure the voucher usage count was not incremented
+    voucher.refresh_from_db(fields=["used"])
+    assert voucher.used == expected_voucher_usage_count
+
+    assert Checkout.objects.filter(
+        pk=checkout.pk
+    ).exists(), "Checkout should not have been deleted"
 
 
 def test_checkout_complete_invalid_checkout_id(user_api_client):
     checkout_id = "invalidId"
-    variables = {"checkoutId": checkout_id}
+    variables = {"checkoutId": checkout_id, "redirectUrl": "https://www.example.com"}
     orders_count = Order.objects.count()
     response = user_api_client.post_graphql(MUTATION_CHECKOUT_COMPLETE, variables)
     content = get_graphql_content(response)
     data = content["data"]["checkoutComplete"]
-    error_message = "Couldn't resolve to a node: %s" % checkout_id
-    assert data["errors"][0]["message"] == error_message
+    assert data["errors"][0]["message"] == "Couldn't resolve to a node: invalidId"
     assert data["errors"][0]["field"] == "checkoutId"
     assert orders_count == Order.objects.count()
 
@@ -923,13 +1371,13 @@ def test_checkout_complete_no_payment(
     checkout.billing_address = address
     checkout.save()
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-    variables = {"checkoutId": checkout_id}
+    variables = {"checkoutId": checkout_id, "redirectUrl": "https://www.example.com"}
     orders_count = Order.objects.count()
     response = user_api_client.post_graphql(MUTATION_CHECKOUT_COMPLETE, variables)
     content = get_graphql_content(response)
     data = content["data"]["checkoutComplete"]
     assert data["errors"][0]["message"] == (
-        "Provided payment methods can not " "cover the checkout's total amount"
+        "Provided payment methods can not cover the checkout's total amount"
     )
     assert orders_count == Order.objects.count()
 
@@ -939,14 +1387,15 @@ def test_checkout_complete_insufficient_stock(
 ):
     checkout = checkout_with_item
     checkout_line = checkout.lines.first()
-    quantity_available = checkout_line.variant.quantity_available
+    stock = Stock.objects.get(product_variant=checkout_line.variant)
+    quantity_available = stock.quantity_available
     checkout_line.quantity = quantity_available + 1
     checkout_line.save()
     checkout.shipping_address = address
     checkout.shipping_method = shipping_method
     checkout.billing_address = address
     checkout.save()
-    total = checkout.get_total()
+    total = calculations.checkout_total(checkout)
     payment = payment_dummy
     payment.is_active = True
     payment.order = None
@@ -955,13 +1404,79 @@ def test_checkout_complete_insufficient_stock(
     payment.checkout = checkout
     payment.save()
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-    variables = {"checkoutId": checkout_id}
+    variables = {"checkoutId": checkout_id, "redirectUrl": "https://www.example.com"}
     orders_count = Order.objects.count()
     response = user_api_client.post_graphql(MUTATION_CHECKOUT_COMPLETE, variables)
     content = get_graphql_content(response)
     data = content["data"]["checkoutComplete"]
-    assert data["errors"][0]["message"] == "Insufficient product stock."
+    assert data["errors"][0]["message"] == "Insufficient product stock: 123"
     assert orders_count == Order.objects.count()
+
+
+def test_checkout_complete_without_redirect_url(
+    user_api_client,
+    checkout_with_gift_card,
+    gift_card,
+    payment_dummy,
+    address,
+    shipping_method,
+):
+
+    assert not gift_card.last_used_on
+
+    checkout = checkout_with_gift_card
+    checkout.shipping_address = address
+    checkout.shipping_method = shipping_method
+    checkout.billing_address = address
+    checkout.save()
+
+    checkout_line = checkout.lines.first()
+    checkout_line_quantity = checkout_line.quantity
+    checkout_line_variant = checkout_line.variant
+
+    gift_current_balance = checkout.get_total_gift_cards_balance()
+    total = calculations.checkout_total(checkout)
+    payment = payment_dummy
+    payment.is_active = True
+    payment.order = None
+    payment.total = total.gross.amount
+    payment.currency = total.gross.currency
+    payment.checkout = checkout
+    payment.save()
+    assert not payment.transactions.exists()
+
+    orders_count = Order.objects.count()
+    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
+    variables = {"checkoutId": checkout_id}
+    response = user_api_client.post_graphql(MUTATION_CHECKOUT_COMPLETE, variables)
+
+    content = get_graphql_content(response)
+    data = content["data"]["checkoutComplete"]
+    assert not data["errors"]
+
+    order_token = data["order"]["token"]
+    assert Order.objects.count() == orders_count + 1
+    order = Order.objects.first()
+    assert order.token == order_token
+    assert order.total.gross == total.gross - gift_current_balance
+
+    order_line = order.lines.first()
+    assert checkout_line_quantity == order_line.quantity
+    assert checkout_line_variant == order_line.variant
+    assert order.shipping_address == address
+    assert order.shipping_method == checkout.shipping_method
+    assert order.payments.exists()
+    order_payment = order.payments.first()
+    assert order_payment == payment
+    assert payment.transactions.count() == 1
+
+    gift_card.refresh_from_db()
+    assert gift_card.current_balance == zero_money()
+    assert gift_card.last_used_on
+
+    assert not Checkout.objects.filter(
+        pk=checkout.pk
+    ).exists(), "Checkout should have been deleted"
 
 
 def test_fetch_checkout_by_token(user_api_client, checkout_with_item):
@@ -985,6 +1500,50 @@ def test_fetch_checkout_by_token(user_api_client, checkout_with_item):
     data = content["data"]["checkout"]
     assert data["token"] == str(checkout_with_item.token)
     assert len(data["lines"]) == checkout_with_item.lines.count()
+
+
+def test_anonymous_client_cant_fetch_checkout_user(api_client, checkout):
+    query = """
+    query getCheckout($token: UUID!) {
+        checkout(token: $token) {
+           user {
+               id
+           }
+        }
+    }
+    """
+    variables = {"token": str(checkout.token)}
+    response = api_client.post_graphql(query, variables)
+    assert_no_permission(response)
+
+
+def test_authorized_access_to_checkout_user(
+    staff_api_client, user_api_client, checkout, customer_user, permission_manage_users
+):
+    query = """
+    query getCheckout($token: UUID!) {
+        checkout(token: $token) {
+           user {
+               id
+           }
+        }
+    }
+    """
+    checkout.user = customer_user
+    checkout.save()
+
+    variables = {"token": str(checkout.token)}
+    customer_user_id = graphene.Node.to_global_id("User", customer_user.id)
+
+    response = user_api_client.post_graphql(query, variables)
+    content = get_graphql_content(response)
+    assert content["data"]["checkout"]["user"]["id"] == customer_user_id
+
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_users]
+    )
+    content = get_graphql_content(response)
+    assert content["data"]["checkout"]["user"]["id"] == customer_user_id
 
 
 def test_fetch_checkout_invalid_token(user_api_client):
@@ -1036,19 +1595,13 @@ def test_checkout_prices(user_api_client, checkout_with_item):
     data = content["data"]["checkout"]
     assert data["token"] == str(checkout_with_item.token)
     assert len(data["lines"]) == checkout_with_item.lines.count()
-    assert data["totalPrice"]["gross"]["amount"] == (
-        checkout_with_item.get_total().gross.amount
-    )
-    assert data["subtotalPrice"]["gross"]["amount"] == (
-        checkout_with_item.get_subtotal().gross.amount
-    )
+    total = calculations.checkout_total(checkout_with_item)
+    assert data["totalPrice"]["gross"]["amount"] == (total.gross.amount)
+    subtotal = calculations.checkout_subtotal(checkout_with_item)
+    assert data["subtotalPrice"]["gross"]["amount"] == (subtotal.gross.amount)
 
 
-@patch("saleor.graphql.checkout.mutations.clean_shipping_method")
-def test_checkout_shipping_method_update(
-    mock_clean_shipping, staff_api_client, shipping_method, checkout_with_item
-):
-    query = """
+MUTATION_UPDATE_SHIPPING_METHOD = """
     mutation checkoutShippingMethodUpdate(
             $checkoutId:ID!, $shippingMethodId:ID!){
         checkoutShippingMethodUpdate(
@@ -1062,26 +1615,48 @@ def test_checkout_shipping_method_update(
             }
         }
     }
-    """
+"""
+
+
+@pytest.mark.parametrize("is_valid_shipping_method", (True, False))
+@patch("saleor.graphql.checkout.mutations.clean_shipping_method")
+def test_checkout_shipping_method_update(
+    mock_clean_shipping,
+    staff_api_client,
+    shipping_method,
+    checkout_with_item,
+    is_valid_shipping_method,
+):
     checkout = checkout_with_item
+    query = MUTATION_UPDATE_SHIPPING_METHOD
+    mock_clean_shipping.return_value = is_valid_shipping_method
+
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
     method_id = graphene.Node.to_global_id("ShippingMethod", shipping_method.id)
-    variables = {"checkoutId": checkout_id, "shippingMethodId": method_id}
-    response = staff_api_client.post_graphql(query, variables)
-    content = get_graphql_content(response)
-    data = content["data"]["checkoutShippingMethodUpdate"]
-    assert not data["errors"]
-    assert data["checkout"]["id"] == checkout_id
+
+    response = staff_api_client.post_graphql(
+        query, {"checkoutId": checkout_id, "shippingMethodId": method_id}
+    )
+    data = get_graphql_content(response)["data"]["checkoutShippingMethodUpdate"]
 
     checkout.refresh_from_db()
-    assert checkout.shipping_method == shipping_method
+
     mock_clean_shipping.assert_called_once_with(
-        checkout=checkout,
-        method=shipping_method,
-        discounts=ANY,
-        taxes=ANY,
-        remove=False,
+        checkout=checkout, method=shipping_method, discounts=ANY
     )
+
+    if is_valid_shipping_method:
+        assert not data["errors"]
+        assert data["checkout"]["id"] == checkout_id
+        assert checkout.shipping_method == shipping_method
+    else:
+        assert data["errors"] == [
+            {
+                "field": "shippingMethod",
+                "message": "This shipping method is not applicable.",
+            }
+        ]
+        assert checkout.shipping_method is None
 
 
 def test_query_checkout_line(checkout_with_item, user_api_client):
@@ -1103,7 +1678,7 @@ def test_query_checkout_line(checkout_with_item, user_api_client):
 
 
 def test_query_checkouts(
-    checkout_with_item, staff_api_client, permission_manage_orders
+    checkout_with_item, staff_api_client, permission_manage_checkouts
 ):
     query = """
     {
@@ -1118,7 +1693,7 @@ def test_query_checkouts(
     """
     checkout = checkout_with_item
     response = staff_api_client.post_graphql(
-        query, {}, permissions=[permission_manage_orders]
+        query, {}, permissions=[permission_manage_checkouts]
     )
     content = get_graphql_content(response)
     received_checkout = content["data"]["checkouts"]["edges"][0]["node"]
@@ -1126,7 +1701,7 @@ def test_query_checkouts(
 
 
 def test_query_checkout_lines(
-    checkout_with_item, staff_api_client, permission_manage_orders
+    checkout_with_item, staff_api_client, permission_manage_checkouts
 ):
     query = """
     {
@@ -1141,7 +1716,7 @@ def test_query_checkout_lines(
     """
     checkout = checkout_with_item
     response = staff_api_client.post_graphql(
-        query, permissions=[permission_manage_orders]
+        query, permissions=[permission_manage_checkouts]
     )
     content = get_graphql_content(response)
     lines = content["data"]["checkoutLines"]["edges"]
@@ -1158,7 +1733,7 @@ def test_clean_checkout(checkout_with_item, payment_dummy, address, shipping_met
     checkout.shipping_method = shipping_method
     checkout.billing_address = address
     checkout.save()
-    total = checkout.get_total()
+    total = calculations.checkout_total(checkout)
     payment = payment_dummy
     payment.is_active = True
     payment.order = None
@@ -1167,7 +1742,7 @@ def test_clean_checkout(checkout_with_item, payment_dummy, address, shipping_met
     payment.checkout = checkout
     payment.save()
     # Shouldn't raise any errors
-    clean_checkout(checkout, None, None)
+    clean_checkout(checkout, None)
 
 
 def test_clean_checkout_no_shipping_method(checkout_with_item, address):
@@ -1176,7 +1751,7 @@ def test_clean_checkout_no_shipping_method(checkout_with_item, address):
     checkout.save()
 
     with pytest.raises(ValidationError) as e:
-        clean_checkout(checkout, None, None)
+        clean_checkout(checkout, None)
 
     msg = "Shipping method is not set"
     assert e.value.error_list[0].message == msg
@@ -1188,7 +1763,7 @@ def test_clean_checkout_no_shipping_address(checkout_with_item, shipping_method)
     checkout.save()
 
     with pytest.raises(ValidationError) as e:
-        clean_checkout(checkout, None, None)
+        clean_checkout(checkout, None)
     msg = "Shipping address is not set"
     assert e.value.error_list[0].message == msg
 
@@ -1203,7 +1778,7 @@ def test_clean_checkout_invalid_shipping_method(
     checkout.save()
 
     with pytest.raises(ValidationError) as e:
-        clean_checkout(checkout, None, None)
+        clean_checkout(checkout, None)
 
     msg = "Shipping method is not valid for your shipping address"
     assert e.value.error_list[0].message == msg
@@ -1218,7 +1793,7 @@ def test_clean_checkout_no_billing_address(
     checkout.save()
 
     with pytest.raises(ValidationError) as e:
-        clean_checkout(checkout, None, None)
+        clean_checkout(checkout, None)
     msg = "Billing address is not set"
     assert e.value.error_list[0].message == msg
 
@@ -1231,7 +1806,7 @@ def test_clean_checkout_no_payment(checkout_with_item, shipping_method, address)
     checkout.save()
 
     with pytest.raises(ValidationError) as e:
-        clean_checkout(checkout, None, None)
+        clean_checkout(checkout, None)
 
     msg = "Provided payment methods can not cover the checkout's total amount"
     assert e.value.error_list[0].message == msg
@@ -1239,7 +1814,7 @@ def test_clean_checkout_no_payment(checkout_with_item, shipping_method, address)
 
 def test_is_fully_paid(checkout_with_item, payment_dummy):
     checkout = checkout_with_item
-    total = checkout.get_total()
+    total = calculations.checkout_total(checkout)
     payment = payment_dummy
     payment.is_active = True
     payment.order = None
@@ -1247,13 +1822,13 @@ def test_is_fully_paid(checkout_with_item, payment_dummy):
     payment.currency = total.gross.currency
     payment.checkout = checkout
     payment.save()
-    is_paid = is_fully_paid(checkout, None, None)
+    is_paid = is_fully_paid(checkout, None)
     assert is_paid
 
 
 def test_is_fully_paid_many_payments(checkout_with_item, payment_dummy):
     checkout = checkout_with_item
-    total = checkout.get_total()
+    total = calculations.checkout_total(checkout)
     payment = payment_dummy
     payment.is_active = True
     payment.order = None
@@ -1269,13 +1844,13 @@ def test_is_fully_paid_many_payments(checkout_with_item, payment_dummy):
     payment2.currency = total.gross.currency
     payment2.checkout = checkout
     payment2.save()
-    is_paid = is_fully_paid(checkout, None, None)
+    is_paid = is_fully_paid(checkout, None)
     assert is_paid
 
 
 def test_is_fully_paid_partially_paid(checkout_with_item, payment_dummy):
     checkout = checkout_with_item
-    total = checkout.get_total()
+    total = calculations.checkout_total(checkout)
     payment = payment_dummy
     payment.is_active = True
     payment.order = None
@@ -1283,149 +1858,11 @@ def test_is_fully_paid_partially_paid(checkout_with_item, payment_dummy):
     payment.currency = total.gross.currency
     payment.checkout = checkout
     payment.save()
-    is_paid = is_fully_paid(checkout, None, None)
+    is_paid = is_fully_paid(checkout, None)
     assert not is_paid
 
 
 def test_is_fully_paid_no_payment(checkout_with_item):
     checkout = checkout_with_item
-    is_paid = is_fully_paid(checkout, None, None)
+    is_paid = is_fully_paid(checkout, None)
     assert not is_paid
-
-
-MUTATION_CHECKOUT_UPDATE_VOUCHER = """
-    mutation($checkoutId: ID!, $voucherCode: String) {
-        checkoutUpdateVoucher(
-            checkoutId: $checkoutId, voucherCode: $voucherCode) {
-            errors {
-                field
-                message
-            }
-            checkout {
-                id,
-                voucherCode
-            }
-        }
-    }
-"""
-
-
-def _mutate_checkout_update_voucher(client, variables):
-    response = client.post_graphql(MUTATION_CHECKOUT_UPDATE_VOUCHER, variables)
-    content = get_graphql_content(response)
-    return content["data"]["checkoutUpdateVoucher"]
-
-
-def test_checkout_add_voucher(api_client, checkout_with_item, voucher):
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout_with_item.pk)
-    variables = {"checkoutId": checkout_id, "voucherCode": voucher.code}
-    data = _mutate_checkout_update_voucher(api_client, variables)
-
-    assert not data["errors"]
-    assert data["checkout"]["id"] == checkout_id
-    assert data["checkout"]["voucherCode"] == voucher.code
-
-
-def test_checkout_remove_voucher(api_client, checkout_with_item):
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout_with_item.pk)
-    variables = {"checkoutId": checkout_id}
-    data = _mutate_checkout_update_voucher(api_client, variables)
-
-    assert not data["errors"]
-    assert data["checkout"]["id"] == checkout_id
-    assert data["checkout"]["voucherCode"] is None
-    assert checkout_with_item.voucher_code is None
-
-
-def test_checkout_add_voucher_invalid_checkout(api_client, voucher):
-    variables = {"checkoutId": "XXX", "voucherCode": voucher.code}
-    data = _mutate_checkout_update_voucher(api_client, variables)
-
-    assert data["errors"]
-    assert data["errors"][0]["field"] == "checkoutId"
-
-
-def test_checkout_add_voucher_invalid_code(api_client, checkout_with_item):
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout_with_item.pk)
-    variables = {"checkoutId": checkout_id, "voucherCode": "XXX"}
-    data = _mutate_checkout_update_voucher(api_client, variables)
-
-    assert data["errors"]
-    assert data["errors"][0]["field"] == "voucherCode"
-
-
-def test_checkout_add_voucher_not_applicable_voucher(
-    api_client, checkout_with_item, voucher_with_high_min_amount_spent
-):
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout_with_item.pk)
-    variables = {
-        "checkoutId": checkout_id,
-        "voucherCode": voucher_with_high_min_amount_spent.code,
-    }
-    data = _mutate_checkout_update_voucher(api_client, variables)
-
-    assert data["errors"]
-    assert data["errors"][0]["field"] == "voucherCode"
-
-
-def test_checkout_lines_delete_with_not_applicable_voucher(
-    user_api_client, checkout_with_item, voucher
-):
-    voucher.min_amount_spent = checkout_with_item.get_subtotal().gross
-    voucher.save(update_fields=["min_amount_spent"])
-
-    add_voucher_to_checkout(voucher, checkout_with_item)
-    assert checkout_with_item.voucher_code == voucher.code
-
-    line = checkout_with_item.lines.first()
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout_with_item.pk)
-    line_id = graphene.Node.to_global_id("CheckoutLine", line.pk)
-    variables = {"checkoutId": checkout_id, "lineId": line_id}
-    response = user_api_client.post_graphql(MUTATION_CHECKOUT_LINES_DELETE, variables)
-    content = get_graphql_content(response)
-
-    data = content["data"]["checkoutLineDelete"]
-    assert not data["errors"]
-    checkout_with_item.refresh_from_db()
-    assert checkout_with_item.lines.count() == 0
-    assert checkout_with_item.voucher_code is None
-
-
-def test_checkout_shipping_address_update_with_not_applicable_voucher(
-    user_api_client,
-    checkout_with_item,
-    voucher_shipping_type,
-    graphql_address_data,
-    address_other_country,
-    shipping_method,
-):
-    assert checkout_with_item.shipping_address is None
-    assert checkout_with_item.voucher_code is None
-
-    checkout_with_item.shipping_address = address_other_country
-    checkout_with_item.shipping_method = shipping_method
-    checkout_with_item.save(update_fields=["shipping_address", "shipping_method"])
-    assert checkout_with_item.shipping_address.country == address_other_country.country
-
-    voucher = voucher_shipping_type
-    assert voucher.countries[0].code == address_other_country.country
-
-    add_voucher_to_checkout(voucher, checkout_with_item)
-    assert checkout_with_item.voucher_code == voucher.code
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout_with_item.pk)
-    new_address = graphql_address_data
-    variables = {"checkoutId": checkout_id, "shippingAddress": new_address}
-    response = user_api_client.post_graphql(
-        MUTATION_CHECKOUT_SHIPPING_ADDRESS_UPDATE, variables
-    )
-    content = get_graphql_content(response)
-    data = content["data"]["checkoutShippingAddressUpdate"]
-    assert not data["errors"]
-
-    checkout_with_item.refresh_from_db()
-    checkout_with_item.shipping_address.refresh_from_db()
-
-    assert checkout_with_item.shipping_address.country == new_address["country"]
-    assert checkout_with_item.voucher_code is None

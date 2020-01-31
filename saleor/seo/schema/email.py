@@ -1,9 +1,13 @@
 import json
+from typing import TYPE_CHECKING
 
 from django.contrib.sites.models import Site
-from django.core.serializers.json import DjangoJSONEncoder
 
 from ...core.utils import build_absolute_uri
+from ...core.utils.json_serializer import HTMLSafeJSON
+
+if TYPE_CHECKING:
+    from ...order.models import OrderLine, Order
 
 
 def get_organization():
@@ -11,22 +15,29 @@ def get_organization():
     return {"@type": "Organization", "name": site.name}
 
 
-def get_product_data(line, organization):
+def get_product_data(line: "OrderLine", organization: dict) -> dict:
     gross_product_price = line.get_total().gross
+    line_name = str(line)
+    if line.translated_product_name:
+        line_name = (
+            f"{line.translated_product_name} ({line.translated_variant_name})"
+            if line.translated_variant_name
+            else line.translated_product_name
+        )
     product_data = {
         "@type": "Offer",
-        "itemOffered": {
-            "@type": "Product",
-            "name": line.translated_product_name or line.product_name,
-            "sku": line.product_sku,
-        },
+        "itemOffered": {"@type": "Product", "name": line_name, "sku": line.product_sku},
         "price": gross_product_price.amount,
         "priceCurrency": gross_product_price.currency,
         "eligibleQuantity": {"@type": "QuantitativeValue", "value": line.quantity},
         "seller": organization,
     }
 
+    if not line.variant:
+        return {}
+
     product = line.variant.product
+    # Deprecated. To remove in #5022
     product_url = build_absolute_uri(product.get_absolute_url())
     product_data["itemOffered"]["url"] = product_url
 
@@ -37,9 +48,10 @@ def get_product_data(line, organization):
     return product_data
 
 
-def get_order_confirmation_markup(order):
-    """Generates schema.org markup for order confirmation e-mail message."""
+def get_order_confirmation_markup(order: "Order") -> str:
+    """Generate schema.org markup for order confirmation e-mail message."""
     organization = get_organization()
+    # Deprecated. To remove in #5022
     order_url = build_absolute_uri(order.get_absolute_url())
     data = {
         "@context": "http://schema.org",
@@ -59,4 +71,4 @@ def get_order_confirmation_markup(order):
     for line in lines:
         product_data = get_product_data(line=line, organization=organization)
         data["acceptedOffer"].append(product_data)
-    return json.dumps(data, cls=DjangoJSONEncoder)
+    return json.dumps(data, cls=HTMLSafeJSON)

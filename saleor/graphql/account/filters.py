@@ -1,7 +1,7 @@
 import django_filters
 from django.db.models import Count, Sum
 
-from ...account.models import User
+from ...account.models import ServiceAccount, User
 from ..core.filters import EnumFilter, ObjectTypeFilter
 from ..core.types.common import DateRangeInput, IntRangeInput, PriceRangeInput
 from ..utils import filter_by_query_param
@@ -18,7 +18,7 @@ def filter_date_joined(qs, _, value):
 
 
 def filter_money_spent(qs, _, value):
-    qs = qs.annotate(money_spent=Sum("orders__total_gross"))
+    qs = qs.annotate(money_spent=Sum("orders__total_gross_amount"))
     money_spent_lte, money_spent_gte = value.get("lte"), value.get("gte")
     if money_spent_lte:
         qs = qs.filter(money_spent__lte=money_spent_lte)
@@ -54,7 +54,7 @@ def filter_status(qs, _, value):
     return qs
 
 
-def filter_search(qs, _, value):
+def filter_staff_search(qs, _, value):
     search_fields = (
         "email",
         "first_name",
@@ -64,6 +64,13 @@ def filter_search(qs, _, value):
         "default_shipping_address__city",
         "default_shipping_address__country",
     )
+    if value:
+        qs = filter_by_query_param(qs, value, search_fields)
+    return qs
+
+
+def filter_search(qs, _, value):
+    search_fields = ("name",)
     if value:
         qs = filter_by_query_param(qs, value, search_fields)
     return qs
@@ -82,7 +89,7 @@ class CustomerFilter(django_filters.FilterSet):
     placed_orders = ObjectTypeFilter(
         input_class=DateRangeInput, method=filter_placed_orders
     )
-    search = django_filters.CharFilter(method=filter_search)
+    search = django_filters.CharFilter(method=filter_staff_search)
 
     class Meta:
         model = User
@@ -95,9 +102,22 @@ class CustomerFilter(django_filters.FilterSet):
         ]
 
 
+class PermissionGroupFilter(django_filters.FilterSet):
+    search = django_filters.CharFilter(method=filter_search)
+
+
+class ServiceAccountFilter(django_filters.FilterSet):
+    search = django_filters.CharFilter(method=filter_search)
+    is_active = django_filters.BooleanFilter()
+
+    class Meta:
+        model = ServiceAccount
+        fields = ["search", "is_active"]
+
+
 class StaffUserFilter(django_filters.FilterSet):
     status = EnumFilter(input_class=StaffMemberStatus, method=filter_status)
-    search = django_filters.CharFilter(method=filter_search)
+    search = django_filters.CharFilter(method=filter_staff_search)
 
     # TODO - Figure out after permision types
     # department = ObjectTypeFilter

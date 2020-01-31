@@ -1,6 +1,7 @@
 import graphene
 from django.utils.text import slugify
 
+from ...core.permissions import PagePermissions
 from ...page import models
 from ..core.mutations import ModelDeleteMutation, ModelMutation
 from ..core.types.common import SeoInput
@@ -11,11 +12,11 @@ class PageInput(graphene.InputObjectType):
     slug = graphene.String(description="Page internal name.")
     title = graphene.String(description="Page title.")
     content = graphene.String(
-        description=("Page content. May consists of ordinary text, HTML and images.")
+        description=("Page content. May consist of ordinary text, HTML and images.")
     )
     content_json = graphene.JSONString(description="Page content in JSON format.")
     is_published = graphene.Boolean(
-        description="Determines if page is visible in the storefront"
+        description="Determines if page is visible in the storefront."
     )
     publication_date = graphene.String(
         description="Publication date. ISO 8601 standard."
@@ -32,14 +33,15 @@ class PageCreate(ModelMutation):
     class Meta:
         description = "Creates a new page."
         model = models.Page
-        permissions = ("page.manage_pages",)
+        permissions = (PagePermissions.MANAGE_PAGES,)
 
     @classmethod
     def clean_input(cls, info, instance, data):
         cleaned_input = super().clean_input(info, instance, data)
         slug = cleaned_input.get("slug", "")
-        if not slug:
-            cleaned_input["slug"] = slugify(cleaned_input["title"])
+        title = cleaned_input.get("title", "")
+        if title and not slug:
+            cleaned_input["slug"] = slugify(title)
         clean_seo_fields(cleaned_input)
         return cleaned_input
 
@@ -63,4 +65,4 @@ class PageDelete(ModelDeleteMutation):
     class Meta:
         description = "Deletes a page."
         model = models.Page
-        permissions = ("page.manage_pages",)
+        permissions = (PagePermissions.MANAGE_PAGES,)

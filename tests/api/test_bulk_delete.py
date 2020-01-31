@@ -20,7 +20,7 @@ from saleor.product.models import (
 )
 from saleor.shipping.models import ShippingMethod, ShippingZone
 
-from .utils import get_graphql_content
+from .utils import get_graphql_content, menu_item_to_json
 
 MUTATION_DELETE_ORDER_LINES = """
     mutation draftOrderLinesBulkDelete($ids: [ID]!) {
@@ -35,12 +35,13 @@ MUTATION_DELETE_ORDER_LINES = """
     """
 
 
-@pytest.fixture
-def attribute_list():
-    attribute_1 = Attribute.objects.create(slug="size", name="Size")
-    attribute_2 = Attribute.objects.create(slug="weight", name="Weight")
-    attribute_3 = Attribute.objects.create(slug="thickness", name="Thickness")
-    return attribute_1, attribute_2, attribute_3
+MUTATION_CATEGORY_BULK_DELETE = """
+    mutation categoryBulkDelete($ids: [ID]!) {
+        categoryBulkDelete(ids: $ids) {
+            count
+        }
+    }
+"""
 
 
 @pytest.fixture
@@ -79,14 +80,6 @@ def product_type_list():
     product_type_2 = ProductType.objects.create(name="Type 2")
     product_type_3 = ProductType.objects.create(name="Type 3")
     return product_type_1, product_type_2, product_type_3
-
-
-@pytest.fixture
-def product_variant_list(product):
-    product_variant_1 = ProductVariant.objects.create(product=product, sku="1")
-    product_variant_2 = ProductVariant.objects.create(product=product, sku="2")
-    product_variant_3 = ProductVariant.objects.create(product=product, sku="3")
-    return product_variant_1, product_variant_2, product_variant_3
 
 
 @pytest.fixture
@@ -183,13 +176,45 @@ def test_delete_attribute_values(
 
 
 def test_delete_categories(staff_api_client, category_list, permission_manage_products):
-    query = """
-    mutation categoryBulkDelete($ids: [ID]!) {
-        categoryBulkDelete(ids: $ids) {
-            count
-        }
+    variables = {
+        "ids": [
+            graphene.Node.to_global_id("Category", category.id)
+            for category in category_list
+        ]
     }
-    """
+    response = staff_api_client.post_graphql(
+        MUTATION_CATEGORY_BULK_DELETE,
+        variables,
+        permissions=[permission_manage_products],
+    )
+    content = get_graphql_content(response)
+
+    assert content["data"]["categoryBulkDelete"]["count"] == 3
+    assert not Category.objects.filter(
+        id__in=[category.id for category in category_list]
+    ).exists()
+
+
+@patch("saleor.product.utils.update_products_minimal_variant_prices_task")
+def test_delete_categories_with_subcategories_and_products(
+    mock_update_products_minimal_variant_prices_task,
+    staff_api_client,
+    category_list,
+    permission_manage_products,
+    product,
+    category,
+):
+    product.category = category
+    category.parent = category_list[0]
+    product.save()
+    category.save()
+
+    parent_product = Product.objects.get(pk=product.pk)
+    parent_product.id = None
+    parent_product.category = category_list[0]
+    parent_product.save()
+
+    product_list = [product, parent_product]
 
     variables = {
         "ids": [
@@ -198,7 +223,9 @@ def test_delete_categories(staff_api_client, category_list, permission_manage_pr
         ]
     }
     response = staff_api_client.post_graphql(
-        query, variables, permissions=[permission_manage_products]
+        MUTATION_CATEGORY_BULK_DELETE,
+        variables,
+        permissions=[permission_manage_products],
     )
     content = get_graphql_content(response)
 
@@ -206,6 +233,20 @@ def test_delete_categories(staff_api_client, category_list, permission_manage_pr
     assert not Category.objects.filter(
         id__in=[category.id for category in category_list]
     ).exists()
+
+    mock_update_products_minimal_variant_prices_task.delay.assert_called_once()
+    (
+        _call_args,
+        call_kwargs,
+    ) = mock_update_products_minimal_variant_prices_task.delay.call_args
+
+    assert set(call_kwargs["product_ids"]) == set([p.pk for p in product_list])
+
+    for product in product_list:
+        product.refresh_from_db()
+        assert not product.category
+        assert not product.is_published
+        assert not product.publication_date
 
 
 def test_delete_collections(
@@ -400,6 +441,9 @@ def test_delete_menu_items(staff_api_client, menu_item_list, permission_manage_m
         }
     }
     """
+    menu = menu_item_list[0].menu
+    items_json = [menu_item_to_json(item) for item in menu_item_list]
+
     variables = {
         "ids": [
             graphene.Node.to_global_id("MenuItem", menu_item.id)
@@ -415,6 +459,10 @@ def test_delete_menu_items(staff_api_client, menu_item_list, permission_manage_m
     assert not MenuItem.objects.filter(
         id__in=[menu_item.id for menu_item in menu_item_list]
     ).exists()
+
+    menu.refresh_from_db()
+    for item_json in items_json:
+        assert item_json not in menu.json_content
 
 
 def test_delete_empty_list_of_ids(staff_api_client, permission_manage_menus):

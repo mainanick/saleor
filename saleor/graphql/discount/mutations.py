@@ -1,7 +1,16 @@
 import graphene
 
+from ...core.permissions import DiscountPermissions
+from ...core.utils.promo_code import (
+    PromoCodeAlreadyExists,
+    generate_promo_code,
+    is_available_promo_code,
+)
 from ...discount import models
-from ...discount.utils import generate_voucher_code
+from ...product.tasks import (
+    update_products_minimal_variant_prices_of_catalogues_task,
+    update_products_minimal_variant_prices_of_discount_task,
+)
 from ..core.mutations import BaseMutation, ModelDeleteMutation, ModelMutation
 from ..core.scalars import Decimal
 from ..product.types import Category, Collection, Product
@@ -30,6 +39,14 @@ class BaseDiscountCatalogueMutation(BaseMutation):
         abstract = True
 
     @classmethod
+    def recalculate_minimal_prices(cls, products, categories, collections):
+        update_products_minimal_variant_prices_of_catalogues_task.delay(
+            product_ids=[p.pk for p in products],
+            category_ids=[c.pk for c in categories],
+            collection_ids=[c.pk for c in collections],
+        )
+
+    @classmethod
     def add_catalogues_to_node(cls, node, input):
         products = input.get("products", [])
         if products:
@@ -43,6 +60,8 @@ class BaseDiscountCatalogueMutation(BaseMutation):
         if collections:
             collections = cls.get_nodes_or_error(collections, "collections", Collection)
             node.collections.add(*collections)
+        # Updated the db entries, recalculating discounts of affected products
+        cls.recalculate_minimal_prices(products, categories, collections)
 
     @classmethod
     def remove_catalogues_from_node(cls, node, input):
@@ -58,18 +77,20 @@ class BaseDiscountCatalogueMutation(BaseMutation):
         if collections:
             collections = cls.get_nodes_or_error(collections, "collections", Collection)
             node.collections.remove(*collections)
+        # Updated the db entries, recalculating discounts of affected products
+        cls.recalculate_minimal_prices(products, categories, collections)
 
 
 class VoucherInput(graphene.InputObjectType):
     type = VoucherTypeEnum(
-        description="Voucher type: product, category shipping or value."
+        description=("Voucher type: PRODUCT, CATEGORY SHIPPING or ENTIRE_ORDER.")
     )
     name = graphene.String(description="Voucher name.")
     code = graphene.String(decription="Code to use the voucher.")
-    start_date = graphene.types.datetime.Date(
+    start_date = graphene.types.datetime.DateTime(
         description="Start date of the voucher in ISO 8601 format."
     )
-    end_date = graphene.types.datetime.Date(
+    end_date = graphene.types.datetime.DateTime(
         description="End date of the voucher in ISO 8601 format."
     )
     discount_value_type = DiscountValueTypeEnum(
@@ -92,9 +113,21 @@ class VoucherInput(graphene.InputObjectType):
     min_amount_spent = Decimal(
         description="Min purchase amount required to apply the voucher."
     )
+    min_checkout_items_quantity = graphene.Int(
+        description="Minimal quantity of checkout items required to apply the voucher."
+    )
     countries = graphene.List(
         graphene.String,
-        description="Country codes that can be used with the shipping voucher",
+        description="Country codes that can be used with the shipping voucher.",
+    )
+    apply_once_per_order = graphene.Boolean(
+        description="Voucher should be applied to the cheapest item or entire order."
+    )
+    apply_once_per_customer = graphene.Boolean(
+        description="Voucher should be applied once per customer."
+    )
+    usage_limit = graphene.Int(
+        description="Limit number of times this voucher can be used in total."
     )
 
 
@@ -107,14 +140,20 @@ class VoucherCreate(ModelMutation):
     class Meta:
         description = "Creates a new voucher."
         model = models.Voucher
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
 
     @classmethod
     def clean_input(cls, info, instance, data):
         code = data.get("code", None)
         if code == "":
-            data["code"] = generate_voucher_code()
+            data["code"] = generate_promo_code()
+        elif not is_available_promo_code(code):
+            raise PromoCodeAlreadyExists()
         cleaned_input = super().clean_input(info, instance, data)
+
+        min_spent_amount = cleaned_input.pop("min_amount_spent", None)
+        if min_spent_amount is not None:
+            cleaned_input["min_spent_amount"] = min_spent_amount
         return cleaned_input
 
 
@@ -128,7 +167,7 @@ class VoucherUpdate(VoucherCreate):
     class Meta:
         description = "Updates a voucher."
         model = models.Voucher
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
 
 
 class VoucherDelete(ModelDeleteMutation):
@@ -138,7 +177,7 @@ class VoucherDelete(ModelDeleteMutation):
     class Meta:
         description = "Deletes a voucher."
         model = models.Voucher
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
 
 
 class VoucherBaseCatalogueMutation(BaseDiscountCatalogueMutation):
@@ -160,7 +199,7 @@ class VoucherBaseCatalogueMutation(BaseDiscountCatalogueMutation):
 class VoucherAddCatalogues(VoucherBaseCatalogueMutation):
     class Meta:
         description = "Adds products, categories, collections to a voucher."
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
 
     @classmethod
     def perform_mutation(cls, _root, info, **data):
@@ -174,7 +213,7 @@ class VoucherAddCatalogues(VoucherBaseCatalogueMutation):
 class VoucherRemoveCatalogues(VoucherBaseCatalogueMutation):
     class Meta:
         description = "Removes products, categories, collections from a voucher."
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
 
     @classmethod
     def perform_mutation(cls, _root, info, **data):
@@ -202,11 +241,24 @@ class SaleInput(graphene.InputObjectType):
         description="Collections related to the discount.",
         name="collections",
     )
-    start_date = graphene.Date(description="Start date of the sale in ISO 8601 format.")
-    end_date = graphene.Date(description="End date of the sale in ISO 8601 format.")
+    start_date = graphene.types.datetime.DateTime(
+        description="Start date of the voucher in ISO 8601 format."
+    )
+    end_date = graphene.types.datetime.DateTime(
+        description="End date of the voucher in ISO 8601 format."
+    )
 
 
-class SaleCreate(ModelMutation):
+class SaleUpdateMinimalVariantPriceMixin:
+    @classmethod
+    def success_response(cls, instance):
+        # Update the "minimal_variant_prices" of the associated, discounted
+        # products (including collections and categories).
+        update_products_minimal_variant_prices_of_discount_task.delay(instance.pk)
+        return super().success_response(instance)
+
+
+class SaleCreate(SaleUpdateMinimalVariantPriceMixin, ModelMutation):
     class Arguments:
         input = SaleInput(
             required=True, description="Fields required to create a sale."
@@ -215,10 +267,10 @@ class SaleCreate(ModelMutation):
     class Meta:
         description = "Creates a new sale."
         model = models.Sale
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
 
 
-class SaleUpdate(ModelMutation):
+class SaleUpdate(SaleUpdateMinimalVariantPriceMixin, ModelMutation):
     class Arguments:
         id = graphene.ID(required=True, description="ID of a sale to update.")
         input = SaleInput(
@@ -228,17 +280,17 @@ class SaleUpdate(ModelMutation):
     class Meta:
         description = "Updates a sale."
         model = models.Sale
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
 
 
-class SaleDelete(ModelDeleteMutation):
+class SaleDelete(SaleUpdateMinimalVariantPriceMixin, ModelDeleteMutation):
     class Arguments:
         id = graphene.ID(required=True, description="ID of a sale to delete.")
 
     class Meta:
         description = "Deletes a sale."
         model = models.Sale
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
 
 
 class SaleBaseCatalogueMutation(BaseDiscountCatalogueMutation):
@@ -260,7 +312,7 @@ class SaleBaseCatalogueMutation(BaseDiscountCatalogueMutation):
 class SaleAddCatalogues(SaleBaseCatalogueMutation):
     class Meta:
         description = "Adds products, categories, collections to a voucher."
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
 
     @classmethod
     def perform_mutation(cls, _root, info, **data):
@@ -274,7 +326,7 @@ class SaleAddCatalogues(SaleBaseCatalogueMutation):
 class SaleRemoveCatalogues(SaleBaseCatalogueMutation):
     class Meta:
         description = "Removes products, categories, collections from a sale."
-        permissions = ("discount.manage_discounts",)
+        permissions = (DiscountPermissions.MANAGE_DISCOUNTS,)
 
     @classmethod
     def perform_mutation(cls, _root, info, **data):
