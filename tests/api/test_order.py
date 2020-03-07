@@ -489,7 +489,7 @@ def test_payment_information_order_events_query(
     assert data["paymentGateway"] == payment_dummy.gateway
 
 
-def test_non_staff_user_can_only_see_his_order(user_api_client, order):
+def test_non_staff_user_cannot_only_see_his_order(user_api_client, order):
     query = """
     query OrderQuery($id: ID!) {
         order(id: $id) {
@@ -500,16 +500,27 @@ def test_non_staff_user_can_only_see_his_order(user_api_client, order):
     ID = graphene.Node.to_global_id("Order", order.id)
     variables = {"id": ID}
     response = user_api_client.post_graphql(query, variables)
-    content = get_graphql_content(response)
-    order_data = content["data"]["order"]
-    assert order_data["number"] == str(order.pk)
+    assert_no_permission(response)
 
-    order.user = None
-    order.save()
-    response = user_api_client.post_graphql(query, variables)
+
+def test_query_order_as_service_account(
+    service_account_api_client, permission_manage_orders, order
+):
+    query = """
+    query OrderQuery($id: ID!) {
+        order(id: $id) {
+            token
+        }
+    }
+    """
+    ID = graphene.Node.to_global_id("Order", order.id)
+    variables = {"id": ID}
+    response = service_account_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_orders]
+    )
     content = get_graphql_content(response)
     order_data = content["data"]["order"]
-    assert not order_data
+    assert order_data["token"] == order.token
 
 
 def test_draft_order_create(
@@ -1328,37 +1339,40 @@ def test_order_update_user_email_existing_user(
     assert order.user == customer_user
 
 
+ORDER_ADD_NOTE_MUTATION = """
+    mutation addNote($id: ID!, $message: String!) {
+        orderAddNote(order: $id, input: {message: $message}) {
+            orderErrors {
+                field
+                message
+                code
+            }
+            order {
+                id
+            }
+            event {
+                user {
+                    email
+                }
+                message
+            }
+        }
+    }
+"""
+
+
 def test_order_add_note_as_staff_user(
     staff_api_client, permission_manage_orders, order_with_lines, staff_user
 ):
     """We are testing that adding a note to an order as a staff user is doing the
     expected behaviors."""
     order = order_with_lines
-    query = """
-        mutation addNote($id: ID!, $message: String) {
-            orderAddNote(order: $id, input: {message: $message}) {
-                errors {
-                    field
-                    message
-                }
-                order {
-                    id
-                }
-                event {
-                    user {
-                        email
-                    }
-                    message
-                }
-            }
-        }
-    """
     assert not order.events.all()
     order_id = graphene.Node.to_global_id("Order", order.id)
     message = "nuclear note"
     variables = {"id": order_id, "message": message}
     response = staff_api_client.post_graphql(
-        query, variables, permissions=[permission_manage_orders]
+        ORDER_ADD_NOTE_MUTATION, variables, permissions=[permission_manage_orders]
     )
     content = get_graphql_content(response)
     data = content["data"]["orderAddNote"]
@@ -1378,6 +1392,21 @@ def test_order_add_note_as_staff_user(
 
     # Ensure not customer events were created as it was a staff action
     assert not CustomerEvent.objects.exists()
+
+
+@pytest.mark.parametrize("message", ("", "   ",))
+def test_order_add_note_fail_on_empty_message(
+    staff_api_client, permission_manage_orders, order_with_lines, message
+):
+    order_id = graphene.Node.to_global_id("Order", order_with_lines.id)
+    variables = {"id": order_id, "message": message}
+    response = staff_api_client.post_graphql(
+        ORDER_ADD_NOTE_MUTATION, variables, permissions=[permission_manage_orders]
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["orderAddNote"]
+    assert data["orderErrors"][0]["field"] == "message"
+    assert data["orderErrors"][0]["code"] == OrderErrorCode.REQUIRED.name
 
 
 CANCEL_ORDER_QUERY = """
@@ -1549,6 +1578,32 @@ def test_order_mark_as_paid(
     event_order_paid = order.events.first()
     assert event_order_paid.type == order_events.OrderEvents.ORDER_MARKED_AS_PAID
     assert event_order_paid.user == staff_user
+
+
+def test_order_mark_as_paid_no_billing_address(
+    staff_api_client, permission_manage_orders, order_with_lines, staff_user
+):
+    order = order_with_lines
+    order_with_lines.billing_address = None
+    order_with_lines.save()
+
+    query = """
+            mutation markPaid($id: ID!) {
+                orderMarkAsPaid(id: $id) {
+                    orderErrors {
+                        code
+                    }
+                }
+            }
+        """
+    order_id = graphene.Node.to_global_id("Order", order.id)
+    variables = {"id": order_id}
+    response = staff_api_client.post_graphql(
+        query, variables, permissions=[permission_manage_orders]
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["orderMarkAsPaid"]["orderErrors"]
+    assert data[0]["code"] == OrderErrorCode.BILLING_ADDRESS_NOT_SET.name
 
 
 ORDER_VOID = """
@@ -1988,6 +2043,36 @@ def test_authorized_access_to_order_by_token(
     )
     content = get_graphql_content(response)
     assert content["data"]["orderByToken"]["user"]["id"] == customer_user_id
+
+
+def test_query_draft_order_by_token_with_requester_as_customer(
+    user_api_client, draft_order
+):
+    draft_order.user = user_api_client.user
+    draft_order.save(update_fields=["user"])
+    query = """
+    query OrderByToken($token: UUID!) {
+        orderByToken(token: $token) {
+            id
+        }
+    }
+    """
+    response = user_api_client.post_graphql(query, {"token": draft_order.token})
+    content = get_graphql_content(response)
+    assert not content["data"]["orderByToken"]
+
+
+def test_query_draft_order_by_token_as_anonymous_customer(api_client, draft_order):
+    query = """
+    query OrderByToken($token: UUID!) {
+        orderByToken(token: $token) {
+            id
+        }
+    }
+    """
+    response = api_client.post_graphql(query, {"token": draft_order.token})
+    content = get_graphql_content(response)
+    assert not content["data"]["orderByToken"]
 
 
 MUTATION_CANCEL_ORDERS = """
@@ -2592,7 +2677,7 @@ def test_user_does_not_need_permission_to_update_meta(
     errors = content["data"]["orderUpdateMeta"]["errors"]
     assert len(errors) == 0
     order.refresh_from_db()
-    assert order.get_meta(namespace="test", client="client1") == {"foo": "bar"}
+    assert order.get_value_from_metadata("foo") == "bar"
 
 
 def test_user_with_permission_can_update_private_meta(
@@ -2612,7 +2697,7 @@ def test_user_with_permission_can_update_private_meta(
     errors = content["data"]["orderUpdatePrivateMeta"]["errors"]
     assert len(errors) == 0
     order.refresh_from_db()
-    assert order.get_private_meta(namespace="test", client="client1") == {"foo": "bar"}
+    assert order.get_value_from_private_metadata("foo") == "bar"
 
 
 @pytest.fixture
@@ -2657,17 +2742,15 @@ def clear_meta_private_variables(order):
         "input": {
             "namespace": "testPrivate",
             "clientName": "clientPrivate1",
-            "key": "foo",
+            "key": "foofoo",
         },
     }
 
 
 @pytest.fixture
 def order_with_meta(order):
-    order.store_meta(namespace="test", client="client1", item={"foo": "bar"})
-    order.store_private_meta(
-        namespace="testPrivate", client="clientPrivate1", item={"foo": "bar"}
-    )
+    order.store_value_in_metadata(items={"foo": "bar"})
+    order.store_value_in_private_metadata(items={"foofoo": "barbar"})
     order.save()
     return order
 
@@ -2706,8 +2789,7 @@ def test_user_with_permission_can_clear_meta(
     errors = content["data"]["orderClearMeta"]["errors"]
     assert len(errors) == 0
     order_with_meta.refresh_from_db()
-    current_meta = order_with_meta.get_meta(namespace="test", client="client1")
-    assert current_meta == {}
+    assert not order_with_meta.get_value_from_metadata("foo")
 
 
 def test_user_with_permission_can_clear_private_meta(
@@ -2728,5 +2810,4 @@ def test_user_with_permission_can_clear_private_meta(
     errors = content["data"]["orderClearPrivateMeta"]["errors"]
     assert len(errors) == 0
     order_with_meta.refresh_from_db()
-    current_meta = order_with_meta.get_private_meta(namespace="test", client="client1")
-    assert current_meta == {}
+    assert not order_with_meta.get_value_from_private_metadata(key="foofoo")

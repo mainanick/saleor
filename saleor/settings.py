@@ -4,6 +4,8 @@ import warnings
 
 import dj_database_url
 import dj_email_url
+import jaeger_client
+import jaeger_client.config
 import sentry_sdk
 from django.contrib.messages import constants as messages
 from django.core.exceptions import ImproperlyConfigured
@@ -158,7 +160,6 @@ context_processors = [
     "django.template.context_processors.debug",
     "django.template.context_processors.media",
     "django.template.context_processors.static",
-    "saleor.checkout.context_processors.checkout_counter",
     "saleor.site.context_processors.site",
 ]
 
@@ -192,8 +193,6 @@ MIDDLEWARE = [
     "saleor.core.middleware.currency",
     "saleor.core.middleware.site",
     "saleor.core.middleware.extensions",
-    "saleor.graphql.middleware.jwt_middleware",
-    "saleor.graphql.middleware.service_account_middleware",
 ]
 
 INSTALLED_APPS = [
@@ -346,9 +345,7 @@ DEFAULT_MAX_EMAIL_DISPLAY_NAME_LENGTH = 78
 # note: having multiple currencies is not supported yet
 AVAILABLE_CURRENCIES = [DEFAULT_CURRENCY]
 
-COUNTRIES_OVERRIDE = {
-    "EU": "European Union",
-}
+COUNTRIES_OVERRIDE = {"EU": "European Union"}
 
 OPENEXCHANGERATES_API_KEY = os.environ.get("OPENEXCHANGERATES_API_KEY")
 
@@ -390,6 +387,8 @@ LOW_STOCK_THRESHOLD = 10
 MAX_CHECKOUT_LINE_QUANTITY = int(os.environ.get("MAX_CHECKOUT_LINE_QUANTITY", 50))
 
 TEST_RUNNER = "tests.runner.PytestTestRunner"
+
+PLAYGROUND_ENABLED = get_bool_from_env("PLAYGROUND_ENABLED", True)
 
 ALLOWED_HOSTS = get_list(os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1"))
 ALLOWED_GRAPHQL_ORIGINS = os.environ.get("ALLOWED_GRAPHQL_ORIGINS", "*")
@@ -483,6 +482,13 @@ CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", None)
 
+# Change this value if your application is running behind a proxy,
+# e.g. HTTP_CF_Connecting_IP for Cloudflare or X_FORWARDED_FOR
+REAL_IP_ENVIRON = os.environ.get("REAL_IP_ENVIRON", "REMOTE_ADDR")
+
+# The maximum length of a graphql query to log in tracings
+OPENTRACING_MAX_QUERY_LENGTH_LOG = 2000
+
 # Rich-text editor
 ALLOWED_TAGS = [
     "a",
@@ -525,6 +531,11 @@ if SENTRY_DSN:
 GRAPHENE = {
     "RELAY_CONNECTION_ENFORCE_FIRST_OR_LAST": True,
     "RELAY_CONNECTION_MAX_LIMIT": 100,
+    "MIDDLEWARE": [
+        "saleor.graphql.middleware.OpentracingGrapheneMiddleware",
+        "saleor.graphql.middleware.JWTMiddleware",
+        "saleor.graphql.middleware.service_account_middleware",
+    ],
 }
 
 EXTENSIONS_MANAGER = "saleor.extensions.manager.ExtensionsManager"
@@ -557,3 +568,26 @@ if (
         "Make sure you've added storefront address to ALLOWED_CLIENT_HOSTS "
         "if ENABLE_ACCOUNT_CONFIRMATION_BY_EMAIL is enabled."
     )
+
+# Initialize a simple and basic Jaeger Tracing integration
+# for open-tracing if enabled.
+#
+# Refer to our guide on https://docs.saleor.io/docs/next/guides/opentracing-jaeger/.
+#
+# If running locally, set:
+#   JAEGER_AGENT_HOST=localhost
+if "JAEGER_AGENT_HOST" in os.environ:
+    jaeger_client.Config(
+        config={
+            "sampler": {"type": "const", "param": 1},
+            "local_agent": {
+                "reporting_port": os.environ.get(
+                    "JAEGER_AGENT_PORT", jaeger_client.config.DEFAULT_REPORTING_PORT
+                ),
+                "reporting_host": os.environ.get("JAEGER_AGENT_HOST"),
+            },
+            "logging": get_bool_from_env("JAEGER_LOGGING", False),
+        },
+        service_name="saleor",
+        validate=True,
+    ).initialize_tracer()

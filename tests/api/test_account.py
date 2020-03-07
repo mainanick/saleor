@@ -466,7 +466,8 @@ def test_me_query(user_api_client):
 
 def test_me_query_anonymous_client(api_client):
     response = api_client.post_graphql(ME_QUERY)
-    assert_no_permission(response)
+    content = get_graphql_content(response)
+    assert content["data"]["me"] is None
 
 
 def test_me_query_customer_can_not_see_note(
@@ -2184,7 +2185,7 @@ def test_account_reset_password(
     url_validator(url)
 
 
-def test_account_confirmation(user_api_client, customer_user):
+def test_account_confirmation(api_client, customer_user):
     customer_user.is_active = False
     customer_user.save()
 
@@ -2192,7 +2193,9 @@ def test_account_confirmation(user_api_client, customer_user):
         "email": customer_user.email,
         "token": default_token_generator.make_token(customer_user),
     }
-    user_api_client.post_graphql(CONFIRM_ACCOUNT_MUTATION, variables)
+    response = api_client.post_graphql(CONFIRM_ACCOUNT_MUTATION, variables)
+    content = get_graphql_content(response)
+    assert not content["data"]["confirmAccount"]["errors"]
 
     customer_user.refresh_from_db()
     assert customer_user.is_active is True

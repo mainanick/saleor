@@ -21,10 +21,13 @@ class WarehouseQueryset(models.QuerySet):
 
 class Warehouse(models.Model):
     id = models.UUIDField(default=uuid.uuid4, primary_key=True)
-    name = models.CharField(max_length=255)
+    name = models.CharField(max_length=250)
+    slug = models.SlugField(max_length=255, unique=True)
     company_name = models.CharField(blank=True, max_length=255)
 
-    shipping_zones = models.ManyToManyField(ShippingZone, blank=True)
+    shipping_zones = models.ManyToManyField(
+        ShippingZone, blank=True, related_name="warehouses"
+    )
     address = models.ForeignKey(Address, on_delete=models.PROTECT)
 
     email = models.EmailField(blank=True, default="")
@@ -65,6 +68,10 @@ class StockQuerySet(models.QuerySet):
     def get_variant_stock_for_country(
         self, country_code: str, product_variant: ProductVariant
     ):
+        """Return the stock information about the a stock for a given country.
+
+        Note it will raise a 'Stock.DoesNotExist' exception if no such stock is found.
+        """
         return self.for_country(country_code).get(product_variant=product_variant)
 
     def get_or_create_for_country(
@@ -96,10 +103,6 @@ class Stock(models.Model):
     @property
     def quantity_available(self) -> int:
         return max(self.quantity - self.quantity_allocated, 0)
-
-    @property
-    def is_available(self):
-        return self.quantity_available > 0
 
     def check_quantity(self, quantity: int):
         if quantity > self.quantity_available:

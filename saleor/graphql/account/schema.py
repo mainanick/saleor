@@ -1,5 +1,4 @@
 import graphene
-from graphql_jwt.decorators import login_required
 
 from ...core.permissions import AccountPermissions
 from ..core.fields import FilterInputConnectionField
@@ -208,9 +207,9 @@ class AccountQueries(graphene.ObjectType):
     def resolve_permission_group(self, info, id):
         return graphene.Node.get_node_from_global_id(info, id, Group)
 
-    @login_required
     def resolve_me(self, info):
-        return info.context.user
+        user = info.context.user
+        return user if user.is_authenticated else None
 
     @permission_required(AccountPermissions.MANAGE_STAFF)
     def resolve_staff_users(self, info, query=None, **kwargs):
@@ -246,7 +245,11 @@ class AccountMutations(graphene.ObjectType):
     account_request_deletion = AccountRequestDeletion.Field()
     account_delete = AccountDelete.Field()
 
-    account_update_meta = AccountUpdateMeta.Field()
+    account_update_meta = AccountUpdateMeta.Field(
+        deprecation_reason=(
+            "Will be removed in Saleor 2.11. Use the `UpdateMetadata` mutation instead."
+        )
+    )
 
     # Staff mutations
     address_create = AddressCreate.Field()
@@ -268,18 +271,46 @@ class AccountMutations(graphene.ObjectType):
     user_avatar_delete = UserAvatarDelete.Field()
     user_bulk_set_active = UserBulkSetActive.Field()
 
-    user_update_metadata = UserUpdateMeta.Field()
-    user_clear_metadata = UserClearMeta.Field()
+    user_update_metadata = UserUpdateMeta.Field(
+        deprecation_reason=(
+            "Will be removed in Saleor 2.11. Use the `UpdateMetadata` mutation instead."
+        )
+    )
+    user_clear_metadata = UserClearMeta.Field(
+        deprecation_reason=(
+            "Will be removed in Saleor 2.11. Use the `DeleteMetadata` mutation instead."
+        )
+    )
 
-    user_update_private_metadata = UserUpdatePrivateMeta.Field()
-    user_clear_private_metadata = UserClearPrivateMeta.Field()
+    user_update_private_metadata = UserUpdatePrivateMeta.Field(
+        deprecation_reason=(
+            "Will be removed in Saleor 2.11."
+            "Use the `UpdatePrivateMetadata` mutation instead."
+        )
+    )
+    user_clear_private_metadata = UserClearPrivateMeta.Field(
+        deprecation_reason=(
+            "Will be removed in Saleor 2.11."
+            "Use the `DeletePrivateMetadata` mutation instead."
+        )
+    )
 
     service_account_create = ServiceAccountCreate.Field()
     service_account_update = ServiceAccountUpdate.Field()
     service_account_delete = ServiceAccountDelete.Field()
 
-    service_account_update_private_metadata = ServiceAccountUpdatePrivateMeta.Field()
-    service_account_clear_private_metadata = ServiceAccountClearPrivateMeta.Field()
+    service_account_update_private_metadata = ServiceAccountUpdatePrivateMeta.Field(
+        deprecation_reason=(
+            "Will be removed in Saleor 2.11."
+            "Use the `UpdatePrivateMetadata` mutation instead."
+        )
+    )
+    service_account_clear_private_metadata = ServiceAccountClearPrivateMeta.Field(
+        deprecation_reason=(
+            "Will be removed in Saleor 2.11."
+            "Use the `DeletePrivateMetadata` mutation instead."
+        )
+    )
 
     service_account_token_create = ServiceAccountTokenCreate.Field()
     service_account_token_delete = ServiceAccountTokenDelete.Field()

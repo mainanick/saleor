@@ -13,7 +13,9 @@ from django.contrib.auth.models import Group, Permission
 from django.contrib.sites.models import Site
 from django.core.files import File
 from django.db.models import Q
+from django.urls import reverse
 from django.utils import timezone
+from django.utils.text import slugify
 from faker import Factory
 from faker.providers import BaseProvider
 from measurement.measures import Weight
@@ -28,6 +30,7 @@ from ...core.permissions import (
     GiftcardPermissions,
     OrderPermissions,
 )
+from ...core.utils import build_absolute_uri
 from ...core.weight import zero_weight
 from ...discount import DiscountValueType, VoucherType
 from ...discount.models import Sale, Voucher
@@ -365,7 +368,7 @@ def create_product_image(product, placeholder_dir, image_name):
     return product_image
 
 
-def create_address():
+def create_address(save=True):
     address = Address(
         first_name=fake.first_name(),
         last_name=fake.last_name(),
@@ -381,30 +384,36 @@ def create_address():
     else:
         address.postal_code = fake.postalcode()
 
-    address.save()
+    if save:
+        address.save()
     return address
 
 
-def create_fake_user():
-    address = create_address()
+def create_fake_user(save=True):
+    address = create_address(save=save)
     email = get_email(address.first_name, address.last_name)
 
     # Skip the email if it already exists
-    if User.objects.filter(email=email).exists():
-        return
+    try:
+        return User.objects.get(email=email)
+    except User.DoesNotExist:
+        pass
 
-    user = User.objects.create_user(
+    user = User(
         first_name=address.first_name,
         last_name=address.last_name,
         email=email,
         password="password",
+        default_billing_address=address,
+        default_shipping_address=address,
+        is_active=True,
+        note=fake.paragraph(),
+        date_joined=fake.date_time(tzinfo=timezone.get_current_timezone()),
     )
 
-    user.addresses.add(address)
-    user.default_billing_address = address
-    user.default_shipping_address = address
-    user.is_active = True
-    user.save()
+    if save:
+        user.save()
+        user.addresses.add(address)
     return user
 
 
@@ -420,7 +429,6 @@ def create_fake_payment(mock_email_confirmation, order):
         payment_token=str(uuid.uuid4()),
         total=order.total.gross.amount,
         currency=order.total.gross.currency,
-        billing_address=order.billing_address,
     )
 
     # Create authorization transaction
@@ -499,14 +507,14 @@ def create_fulfillments(order):
 
 
 def create_fake_order(discounts, max_order_lines=5):
-    user = random.choice(
-        [None, User.objects.filter(is_superuser=False).order_by("?").first()]
-    )
-    if user:
-        address = user.default_shipping_address
+    customers = User.objects.filter(is_superuser=False).order_by("?")
+    customer = random.choice([None, customers.first()])
+
+    if customer:
+        address = customer.default_shipping_address
         order_data = {
-            "user": user,
-            "billing_address": user.default_billing_address,
+            "user": customer,
+            "billing_address": customer.default_billing_address,
             "shipping_address": address,
         }
     else:
@@ -579,7 +587,7 @@ def create_permission_groups():
 
 
 def create_group(name, permissions, users):
-    group = Group.objects.create(name=name)
+    group, _ = Group.objects.get_or_create(name=name)
     group.permissions.add(*permissions)
     group.user_set.add(*users)
     return group
@@ -588,14 +596,18 @@ def create_group(name, permissions, users):
 def create_staff_users(how_many=2, superuser=False):
     users = []
     for _ in range(how_many):
-        first_name = fake.first_name()
-        last_name = fake.last_name()
+        address = create_address()
+        first_name = address.first_name
+        last_name = address.last_name
         email = get_email(first_name, last_name)
+
         staff_user = User.objects.create_user(
             first_name=first_name,
             last_name=last_name,
             email=email,
             password="password",
+            default_billing_address=address,
+            default_shipping_address=address,
             is_staff=True,
             is_active=True,
             is_superuser=superuser,
@@ -937,8 +949,10 @@ def create_shipping_zones():
 
 def create_warehouses():
     for shipping_zone in ShippingZone.objects.all():
+        shipping_zone_name = shipping_zone.name
         warehouse, _ = Warehouse.objects.update_or_create(
-            name=shipping_zone.name,
+            name=shipping_zone_name,
+            slug=slugify(shipping_zone_name),
             defaults={"company_name": fake.company(), "address": create_address()},
         )
         warehouse.shipping_zones.add(shipping_zone)
@@ -967,6 +981,19 @@ def create_vouchers():
             "discount_value_type": DiscountValueType.FIXED,
             "discount_value": 25,
             "min_spent": Money(200, settings.DEFAULT_CURRENCY),
+        },
+    )
+    if created:
+        yield "Voucher #%d" % voucher.id
+    else:
+        yield "Value voucher already exists"
+
+    voucher, created = Voucher.objects.get_or_create(
+        code="VCO9KV98LC",
+        defaults={
+            "type": VoucherType.ENTIRE_ORDER,
+            "discount_value_type": DiscountValueType.PERCENTAGE,
+            "discount_value": 5,
         },
     )
     if created:
@@ -1156,8 +1183,16 @@ def create_menus():
             name=collection.name, collection=collection, parent=item
         )
 
+    item_saleor = bottom_menu.items.get_or_create(name="Saleor", url="/")[0]
+
     page = Page.objects.order_by("?")[0]
-    bottom_menu.items.get_or_create(name=page.title, page=page)
+    item_saleor.children.get_or_create(name=page.title, page=page, menu=bottom_menu)
+
+    api_url = build_absolute_uri(reverse("api"))
+    item_saleor.children.get_or_create(
+        name="GraphQL API", url=api_url, menu=bottom_menu
+    )
+
     yield "Created footer menu"
     update_menu(top_menu)
     update_menu(bottom_menu)

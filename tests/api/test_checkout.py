@@ -1180,6 +1180,7 @@ MUTATION_CHECKOUT_COMPLETE = """
                 field,
                 message
             }
+            confirmationNeeded
         }
     }
     """
@@ -1201,10 +1202,8 @@ def test_checkout_complete(
     checkout.shipping_address = address
     checkout.shipping_method = shipping_method
     checkout.billing_address = address
-    checkout.store_meta(namespace="PUBLIC", client="PLUGIN", item={"accepted": "true"})
-    checkout.store_private_meta(
-        namespace="PRIVATE", client="PLUGIN", item={"accepted": "true"}
-    )
+    checkout.store_value_in_metadata(items={"accepted": "true"})
+    checkout.store_value_in_private_metadata(items={"accepted": "false"})
     checkout.save()
 
     checkout_line = checkout.lines.first()
@@ -1236,8 +1235,8 @@ def test_checkout_complete(
     order = Order.objects.first()
     assert order.token == order_token
     assert order.total.gross == total.gross - gift_current_balance
-    assert order.meta == checkout.meta
-    assert order.private_meta == checkout.private_meta
+    assert order.metadata == checkout.metadata
+    assert order.private_metadata == checkout.private_metadata
 
     order_line = order.lines.first()
     assert checkout_line_quantity == order_line.quantity
@@ -1252,6 +1251,73 @@ def test_checkout_complete(
     gift_card.refresh_from_db()
     assert gift_card.current_balance == zero_money()
     assert gift_card.last_used_on
+
+    assert not Checkout.objects.filter(
+        pk=checkout.pk
+    ).exists(), "Checkout should have been deleted"
+
+
+@pytest.mark.integration
+def test_checkout_with_voucher_complete(
+    user_api_client,
+    checkout_with_voucher_percentage,
+    voucher_percentage,
+    payment_dummy,
+    address,
+    shipping_method,
+):
+    voucher_used_count = voucher_percentage.used
+
+    checkout = checkout_with_voucher_percentage
+    checkout.shipping_address = address
+    checkout.shipping_method = shipping_method
+    checkout.billing_address = address
+    checkout.store_value_in_metadata(items={"accepted": "true"})
+    checkout.store_value_in_private_metadata(items={"accepted": "false"})
+    checkout.save()
+
+    checkout_line = checkout.lines.first()
+    checkout_line_quantity = checkout_line.quantity
+    checkout_line_variant = checkout_line.variant
+
+    total = calculations.checkout_total(checkout)
+    payment = payment_dummy
+    payment.is_active = True
+    payment.order = None
+    payment.total = total.gross.amount
+    payment.currency = total.gross.currency
+    payment.checkout = checkout
+    payment.save()
+    assert not payment.transactions.exists()
+
+    orders_count = Order.objects.count()
+    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
+    variables = {"checkoutId": checkout_id, "redirectUrl": "https://www.example.com"}
+    response = user_api_client.post_graphql(MUTATION_CHECKOUT_COMPLETE, variables)
+
+    content = get_graphql_content(response)
+    data = content["data"]["checkoutComplete"]
+    assert not data["errors"]
+
+    order_token = data["order"]["token"]
+    assert Order.objects.count() == orders_count + 1
+    order = Order.objects.first()
+    assert order.token == order_token
+    assert order.metadata == checkout.metadata
+    assert order.private_metadata == checkout.private_metadata
+
+    order_line = order.lines.first()
+    assert checkout_line_quantity == order_line.quantity
+    assert checkout_line_variant == order_line.variant
+    assert order.shipping_address == address
+    assert order.shipping_method == checkout.shipping_method
+    assert order.payments.exists()
+    order_payment = order.payments.first()
+    assert order_payment == payment
+    assert payment.transactions.count() == 1
+
+    voucher_percentage.refresh_from_db()
+    assert voucher_percentage.used == voucher_used_count + 1
 
     assert not Checkout.objects.filter(
         pk=checkout.pk
@@ -1291,13 +1357,13 @@ def fake_manager(mocker):
 
 @pytest.fixture
 def mock_get_manager(mocker, fake_manager):
-    mgr = mocker.patch(
+    manager = mocker.patch(
         "saleor.payment.gateway.get_extensions_manager",
         autospec=True,
         return_value=fake_manager,
     )
     yield fake_manager
-    mgr.assert_called_once()
+    manager.assert_called_once()
 
 
 def test_checkout_complete_does_not_delete_checkout_after_unsuccessful_payment(
@@ -1380,6 +1446,111 @@ def test_checkout_complete_no_payment(
         "Provided payment methods can not cover the checkout's total amount"
     )
     assert orders_count == Order.objects.count()
+
+
+ACTION_REQUIRED_GATEWAY_RESPONSE = GatewayResponse(
+    is_success=True,
+    action_required=True,
+    kind=TransactionKind.CAPTURE,
+    amount=Decimal(3.0),
+    currency="usd",
+    transaction_id="1234",
+    error=None,
+)
+
+TRANSACTION_CONFIRM_GATEWAY_RESPONSE = GatewayResponse(
+    is_success=False,
+    action_required=False,
+    kind=TransactionKind.CONFIRM,
+    amount=Decimal(3.0),
+    currency="usd",
+    transaction_id="1234",
+    error=None,
+)
+
+
+def test_checkout_complete_confirmation_needed(
+    mock_get_manager,
+    user_api_client,
+    checkout_with_item,
+    address,
+    payment_dummy,
+    shipping_method,
+):
+    mock_get_manager.process_payment.return_value = ACTION_REQUIRED_GATEWAY_RESPONSE
+    checkout = checkout_with_item
+    checkout.shipping_address = address
+    checkout.shipping_method = shipping_method
+    checkout.billing_address = address
+    checkout.save()
+
+    total = calculations.checkout_total(checkout)
+    payment = payment_dummy
+    payment.is_active = True
+    payment.order = None
+    payment.total = total.gross.amount
+    payment.currency = total.gross.currency
+    payment.checkout = checkout
+    payment.save()
+
+    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
+    variables = {"checkoutId": checkout_id, "redirectUrl": "https://www.example.com"}
+    orders_count = Order.objects.count()
+
+    response = user_api_client.post_graphql(MUTATION_CHECKOUT_COMPLETE, variables)
+    content = get_graphql_content(response)
+    data = content["data"]["checkoutComplete"]
+    assert not data["errors"]
+    assert data["confirmationNeeded"] is True
+
+    new_orders_count = Order.objects.count()
+    assert new_orders_count == orders_count
+    checkout.refresh_from_db()
+    payment_dummy.refresh_from_db()
+    assert payment_dummy.is_active
+    assert payment_dummy.to_confirm
+
+
+def test_checkout_confirm(
+    user_api_client,
+    mock_get_manager,
+    checkout_with_item,
+    payment_txn_to_confirm,
+    address,
+    shipping_method,
+):
+    mock_get_manager.confirm_payment.return_value = ACTION_REQUIRED_GATEWAY_RESPONSE
+
+    checkout = checkout_with_item
+    checkout.shipping_address = address
+    checkout.shipping_method = shipping_method
+    checkout.billing_address = address
+    checkout.save()
+
+    total = calculations.checkout_total(checkout)
+    payment = payment_txn_to_confirm
+    payment.is_active = True
+    payment.order = None
+    payment.total = total.gross.amount
+    payment.currency = total.gross.currency
+    payment.checkout = checkout
+    payment.save()
+
+    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
+    orders_count = Order.objects.count()
+
+    variables = {"checkoutId": checkout_id, "redirectUrl": "https://www.example.com"}
+    response = user_api_client.post_graphql(MUTATION_CHECKOUT_COMPLETE, variables)
+    content = get_graphql_content(response)
+    data = content["data"]["checkoutComplete"]
+
+    assert not data["errors"]
+    assert not data["confirmationNeeded"]
+
+    mock_get_manager.confirm_payment.assert_called_once()
+
+    new_orders_count = Order.objects.count()
+    assert new_orders_count == orders_count + 1
 
 
 def test_checkout_complete_insufficient_stock(
@@ -1517,8 +1688,8 @@ def test_anonymous_client_cant_fetch_checkout_user(api_client, checkout):
     assert_no_permission(response)
 
 
-def test_authorized_access_to_checkout_user(
-    staff_api_client, user_api_client, checkout, customer_user, permission_manage_users
+def test_authorized_access_to_checkout_user_as_customer(
+    user_api_client, checkout, customer_user,
 ):
     query = """
     query getCheckout($token: UUID!) {
@@ -1539,23 +1710,182 @@ def test_authorized_access_to_checkout_user(
     content = get_graphql_content(response)
     assert content["data"]["checkout"]["user"]["id"] == customer_user_id
 
+
+def test_authorized_access_to_checkout_user_as_staff(
+    staff_api_client,
+    checkout,
+    customer_user,
+    permission_manage_users,
+    permission_manage_checkouts,
+):
+    query = """
+    query getCheckout($token: UUID!) {
+        checkout(token: $token) {
+           user {
+               id
+           }
+        }
+    }
+    """
+    checkout.user = customer_user
+    checkout.save()
+
+    variables = {"token": str(checkout.token)}
+    customer_user_id = graphene.Node.to_global_id("User", customer_user.id)
+
     response = staff_api_client.post_graphql(
-        query, variables, permissions=[permission_manage_users]
+        query,
+        variables,
+        permissions=[permission_manage_users, permission_manage_checkouts],
+        check_no_permissions=False,
     )
     content = get_graphql_content(response)
     assert content["data"]["checkout"]["user"]["id"] == customer_user_id
 
 
-def test_fetch_checkout_invalid_token(user_api_client):
+def test_authorized_access_to_checkout_user_as_staff_no_permission(
+    staff_api_client, checkout, customer_user, permission_manage_checkouts,
+):
     query = """
-        query getCheckout($token: UUID!) {
-            checkout(token: $token) {
-                token
-            }
+    query getCheckout($token: UUID!) {
+        checkout(token: $token) {
+           user {
+               id
+           }
         }
+    }
     """
+    checkout.user = customer_user
+    checkout.save()
+
+    variables = {"token": str(checkout.token)}
+
+    response = staff_api_client.post_graphql(
+        query,
+        variables,
+        permissions=[permission_manage_checkouts],
+        check_no_permissions=False,
+    )
+    assert_no_permission(response)
+
+
+QUERY_CHECKOUT = """
+query getCheckout($token: UUID!) {
+    checkout(token: $token) {
+        token
+    }
+}
+"""
+
+
+def test_query_anonymous_customer_checkout_as_anonymous_customer(api_client, checkout):
+    variables = {"token": str(checkout.token)}
+    response = api_client.post_graphql(QUERY_CHECKOUT, variables)
+    content = get_graphql_content(response)
+    assert content["data"]["checkout"]["token"] == str(checkout.token)
+
+
+def test_query_anonymous_customer_checkout_as_customer(user_api_client, checkout):
+    variables = {"token": str(checkout.token)}
+    response = user_api_client.post_graphql(QUERY_CHECKOUT, variables)
+    content = get_graphql_content(response)
+    assert content["data"]["checkout"]["token"] == str(checkout.token)
+
+
+def test_query_anonymous_customer_checkout_as_staff_user(
+    staff_api_client, checkout, permission_manage_checkouts
+):
+    variables = {"token": str(checkout.token)}
+    response = staff_api_client.post_graphql(
+        QUERY_CHECKOUT,
+        variables,
+        permissions=[permission_manage_checkouts],
+        check_no_permissions=False,
+    )
+    content = get_graphql_content(response)
+    assert content["data"]["checkout"]["token"] == str(checkout.token)
+
+
+def test_query_anonymous_customer_checkout_as_service_account(
+    service_account_api_client, checkout, permission_manage_checkouts
+):
+    variables = {"token": str(checkout.token)}
+    response = service_account_api_client.post_graphql(
+        QUERY_CHECKOUT,
+        variables,
+        permissions=[permission_manage_checkouts],
+        check_no_permissions=False,
+    )
+    content = get_graphql_content(response)
+    assert content["data"]["checkout"]["token"] == str(checkout.token)
+
+
+def test_query_customer_checkout_as_anonymous_customer(
+    api_client, checkout, customer_user
+):
+    checkout.user = customer_user
+    checkout.save(update_fields=["user"])
+    variables = {"token": str(checkout.token)}
+    response = api_client.post_graphql(QUERY_CHECKOUT, variables)
+    content = get_graphql_content(response)
+    assert not content["data"]["checkout"]
+
+
+def test_query_customer_checkout_as_customer(user_api_client, checkout, customer_user):
+    checkout.user = customer_user
+    checkout.save(update_fields=["user"])
+    variables = {"token": str(checkout.token)}
+    response = user_api_client.post_graphql(QUERY_CHECKOUT, variables)
+    content = get_graphql_content(response)
+    assert content["data"]["checkout"]["token"] == str(checkout.token)
+
+
+def test_query_other_customer_checkout_as_customer(
+    user_api_client, checkout, staff_user
+):
+    checkout.user = staff_user
+    checkout.save(update_fields=["user"])
+    variables = {"token": str(checkout.token)}
+    response = user_api_client.post_graphql(QUERY_CHECKOUT, variables)
+    content = get_graphql_content(response)
+    assert not content["data"]["checkout"]
+
+
+def test_query_customer_checkout_as_staff_user(
+    service_account_api_client, checkout, customer_user, permission_manage_checkouts
+):
+    checkout.user = customer_user
+    checkout.save(update_fields=["user"])
+    variables = {"token": str(checkout.token)}
+    response = service_account_api_client.post_graphql(
+        QUERY_CHECKOUT,
+        variables,
+        permissions=[permission_manage_checkouts],
+        check_no_permissions=False,
+    )
+    content = get_graphql_content(response)
+    assert content["data"]["checkout"]["token"] == str(checkout.token)
+
+
+def test_query_customer_checkout_as_service_account(
+    staff_api_client, checkout, customer_user, permission_manage_checkouts
+):
+    checkout.user = customer_user
+    checkout.save(update_fields=["user"])
+    variables = {"token": str(checkout.token)}
+    response = staff_api_client.post_graphql(
+        QUERY_CHECKOUT,
+        variables,
+        permissions=[permission_manage_checkouts],
+        check_no_permissions=False,
+    )
+    content = get_graphql_content(response)
+    assert content["data"]["checkout"]["token"] == str(checkout.token)
+
+
+def test_fetch_checkout_invalid_token(user_api_client):
     variables = {"token": str(uuid.uuid4())}
-    response = user_api_client.post_graphql(query, variables)
+    response = user_api_client.post_graphql(QUERY_CHECKOUT, variables)
     content = get_graphql_content(response)
     data = content["data"]["checkout"]
     assert data is None

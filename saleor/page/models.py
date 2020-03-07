@@ -15,8 +15,8 @@ class PagePublishedQuerySet(PublishedQuerySet):
 
 
 class Page(SeoModel, PublishableModel):
-    slug = models.SlugField(unique=True, max_length=100)
-    title = models.CharField(max_length=200)
+    slug = models.SlugField(unique=True, max_length=255)
+    title = models.CharField(max_length=250)
     content = models.TextField(blank=True)
     content_json = SanitizedJSONField(
         blank=True, default=dict, sanitizer=clean_draft_js
@@ -32,11 +32,6 @@ class Page(SeoModel, PublishableModel):
 
     def __str__(self):
         return self.title
-
-    # Deprecated. To remove in #5022
-    @staticmethod
-    def get_absolute_url():
-        return ""
 
 
 class PageTranslation(SeoModelTranslation):
